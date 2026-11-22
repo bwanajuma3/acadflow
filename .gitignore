@@ -1,0 +1,6 @@
+.env
+.streamlit/secrets.toml
+venv/
+*.db
+acadflow_storage/
+__pycache__/
