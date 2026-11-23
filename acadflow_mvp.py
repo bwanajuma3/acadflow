@@ -123,6 +123,7 @@ class User(Base):
     email = Column(String, unique=True, nullable=False)
     password_hash = Column(String, nullable=False)
     role = Column(String, nullable=False)  # SUPER_ADMIN, TENANT_ADMIN, STAFF, CLIENT
+    commission_rate = Column(Float, default=50.0)  # Default % share for STAFF
 
 class Service(Base):
     __tablename__ = "services"
@@ -148,6 +149,10 @@ class Assignment(Base):
     priority = Column(String, default="Normal")
     quoted_cost_kes = Column(Float, default=0.0)
     amount_paid_kes = Column(Float, default=0.0)
+    staff_commission_pct = Column(Float, default=50.0)
+    staff_payout_status = Column(String, default="Unpaid")  # Unpaid, Paid
+    staff_payout_mpesa = Column(String, default="")
+    staff_paid_at = Column(DateTime, nullable=True)
     deadline = Column(DateTime, nullable=False)
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utc_now)
@@ -264,17 +269,62 @@ try:
             am_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(assignment_messages)")).fetchall()]
             if "channel" not in am_cols:
                 conn.execute(text("ALTER TABLE assignment_messages ADD COLUMN channel VARCHAR DEFAULT 'CLIENT_CHAT'"))
+            u_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(users)")).fetchall()]
+            if "commission_rate" not in u_cols:
+                conn.execute(text("ALTER TABLE users ADD COLUMN commission_rate FLOAT DEFAULT 50.0"))
+            a_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(assignments)")).fetchall()]
+            if "staff_commission_pct" not in a_cols:
+                conn.execute(text("ALTER TABLE assignments ADD COLUMN staff_commission_pct FLOAT DEFAULT 50.0"))
+            if "staff_payout_status" not in a_cols:
+                conn.execute(text("ALTER TABLE assignments ADD COLUMN staff_payout_status VARCHAR DEFAULT 'Unpaid'"))
+            if "staff_payout_mpesa" not in a_cols:
+                conn.execute(text("ALTER TABLE assignments ADD COLUMN staff_payout_mpesa VARCHAR DEFAULT ''"))
+            if "staff_paid_at" not in a_cols:
+                conn.execute(text("ALTER TABLE assignments ADD COLUMN staff_paid_at DATETIME"))
         else:
             conn.execute(text("ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS checkout_request_id VARCHAR;"))
             conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN IF NOT EXISTS checkout_request_id VARCHAR;"))
             conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN IF NOT EXISTS phone_number VARCHAR;"))
             conn.execute(text("ALTER TABLE assignment_messages ADD COLUMN IF NOT EXISTS channel VARCHAR DEFAULT 'CLIENT_CHAT';"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS commission_rate FLOAT DEFAULT 50.0;"))
+            conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS staff_commission_pct FLOAT DEFAULT 50.0;"))
+            conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS staff_payout_status VARCHAR DEFAULT 'Unpaid';"))
+            conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS staff_payout_mpesa VARCHAR DEFAULT '';"))
+            conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS staff_paid_at TIMESTAMP;"))
 except Exception:
     pass
 
 # ==========================================
-# 3. TENANT REPUTATION, TURNAROUND & EMAIL SERVICES
+# 3. COMMISSION, TURNAROUND & EMAIL SERVICES
 # ==========================================
+def compute_assignment_commission(db, assignment: Assignment) -> dict:
+    """Calculates Staff Earnings, Agency Net Profit, and payout eligibility (Paid + Deliverable Approved)."""
+    quoted = float(assignment.quoted_cost_kes or 0.0)
+    paid = float(assignment.amount_paid_kes or 0.0)
+    pct = float(getattr(assignment, "staff_commission_pct", 50.0) or 50.0)
+    staff_earnings = round(quoted * (pct / 100.0), 2) if assignment.staff_id else 0.0
+    agency_net = round(quoted - staff_earnings, 2)
+
+    is_paid = (quoted > 0) and (paid >= quoted)
+    has_deliverable = db.query(AssignmentDocument).filter_by(
+        tenant_id=assignment.tenant_id,
+        assignment_id=assignment.id,
+        doc_category="DELIVERABLE"
+    ).count() > 0
+
+    payout_status = getattr(assignment, "staff_payout_status", "Unpaid") or "Unpaid"
+    is_payable = bool(assignment.staff_id and is_paid and has_deliverable and payout_status != "Paid")
+
+    return {
+        "commission_pct": pct,
+        "staff_earnings": staff_earnings,
+        "agency_net": agency_net,
+        "is_paid": is_paid,
+        "has_deliverable": has_deliverable,
+        "is_payable": is_payable,
+        "payout_status": payout_status,
+    }
+
 def get_tenant_public_metrics(db, tenant_id: int) -> dict:
     """Computes public rating, review count, and turnaround time (actual completed or catalogue average)."""
     reviews = db.query(ClientReview).filter_by(tenant_id=tenant_id).all()
@@ -544,13 +594,13 @@ def seed_database():
 
     users = [
         User(tenant_id=t1.id, full_name="Dr. Kamau Njoroge (Admin)", email="admin@nairobihub.co.ke",
-             password_hash=hash_password("admin123"), role="TENANT_ADMIN"),
+             password_hash=hash_password("admin123"), role="TENANT_ADMIN", commission_rate=0.0),
         User(tenant_id=t1.id, full_name="Mercy Wanjiku (Senior Statistician)", email="mercy@nairobihub.co.ke",
-             password_hash=hash_password("staff123"), role="STAFF"),
+             password_hash=hash_password("staff123"), role="STAFF", commission_rate=55.0),
         User(tenant_id=t1.id, full_name="Brian Ochieng (MSc Client)", email="brian@student.ac.ke",
              password_hash=hash_password("client123"), role="CLIENT"),
         User(tenant_id=t2.id, full_name="Grace Mutua (Admin)", email="admin@scholarassist.co.ke",
-             password_hash=hash_password("admin123"), role="TENANT_ADMIN"),
+             password_hash=hash_password("admin123"), role="TENANT_ADMIN", commission_rate=0.0),
         User(tenant_id=t2.id, full_name="David Kiprop (PhD Client)", email="david@university.ac.ke",
              password_hash=hash_password("client123"), role="CLIENT"),
     ]
@@ -577,6 +627,7 @@ def seed_database():
         service_id=s1.id, client_id=brian.id, staff_id=mercy.id,
         status="7. In progress", priority="High",
         quoted_cost_kes=18000, amount_paid_kes=10000,
+        staff_commission_pct=55.0,
         deadline=utc_now() + timedelta(days=3)
     )
     a2 = Assignment(
@@ -604,7 +655,7 @@ def seed_database():
     ])
     db.add(PlatformAnnouncement(
         title="Welcome to AcadFlow",
-        message="Automated PDF Quotations/Invoices and M-Pesa STK Push integration are now live across all workspaces!"
+        message="Automated PDF Quotations/Invoices, M-Pesa STK Push, and Staff Commission Tracking are live!"
     ))
     db.commit()
     db.close()
@@ -722,7 +773,8 @@ if not current_user:
                                 full_name=adm_name.strip(),
                                 email=adm_email.strip(),
                                 password_hash=hash_password(adm_pass),
-                                role="TENANT_ADMIN"
+                                role="TENANT_ADMIN",
+                                commission_rate=0.0
                             )
                             db.add(new_admin)
                             db.commit()
@@ -767,7 +819,8 @@ with st.sidebar:
     else:
         st.warning("**Mode:** Central Platform Control (Super Admin)")
 
-    st.markdown(f"**User:** {current_user.full_name}  \n**Email:** `{current_user.email}`  \n**Role:** `{current_user.role}`")
+    role_extra = f" | Default Rate: `{getattr(current_user, 'commission_rate', 50.0):.0f}%`" if current_user.role == "STAFF" else ""
+    st.markdown(f"**User:** {current_user.full_name}  \n**Email:** `{current_user.email}`  \n**Role:** `{current_user.role}`{role_extra}")
     st.divider()
 
     with st.expander("🔑 Account & Password Security"):
@@ -1008,7 +1061,6 @@ else:
                 chk_display = f" | CheckoutID: `{sp.checkout_request_id}`" if getattr(sp, "checkout_request_id", "") else ""
                 st.caption(f"• **{sp.plan_name}** | KES {sp.amount_kes:,.0f} | Status: `{sp.status}` | Ref: `{sp.mpesa_code}`{chk_display}")
 
-    # Enforce active subscription only for Tenant Admin / Staff (Clients can pick any active tenant)
     if current_user.role in ["TENANT_ADMIN", "STAFF"] and tenant and tenant.status in ["Suspended", "Expired"]:
         st.error(f"⛔ This workspace is currently **{tenant.status}**. Complete a subscription payment below to reactivate automatically.")
         if current_user.role == "TENANT_ADMIN":
@@ -1065,6 +1117,28 @@ else:
             c5.metric("Outstanding", f"KES {outstanding:,.0f}")
             st.divider()
 
+        elif current_user.role == "STAFF":
+            # Staff "My Earnings & Payouts" Summary Card
+            earned_payable = 0.0
+            pending_pipeline = 0.0
+            total_paid_out = 0.0
+            for sa_item in assignments:
+                c_info = compute_assignment_commission(db, sa_item)
+                if c_info["payout_status"] == "Paid":
+                    total_paid_out += c_info["staff_earnings"]
+                elif c_info["is_payable"]:
+                    earned_payable += c_info["staff_earnings"]
+                else:
+                    pending_pipeline += c_info["staff_earnings"]
+
+            with st.container(border=True):
+                st.markdown("#### 💵 My Earnings & Payouts")
+                sc1, sc2, sc3 = st.columns(3)
+                sc1.metric("Earned & Ready for Payout", f"KES {earned_payable:,.0f}")
+                sc2.metric("In-Progress / Awaiting Client Pay", f"KES {pending_pipeline:,.0f}")
+                sc3.metric("Total Paid Out", f"KES {total_paid_out:,.0f}")
+            st.divider()
+
         if not assignments:
             st.info("No projects found in your view.")
         else:
@@ -1075,12 +1149,12 @@ else:
                 srv_obj = db.query(Service).filter_by(id=a.service_id).first()
                 balance = max(0.0, a.quoted_cost_kes - a.amount_paid_kes)
 
-                # Check completion/closure prerequisites
                 all_proj_docs = db.query(AssignmentDocument).filter_by(tenant_id=a.tenant_id, assignment_id=a.id).all()
                 client_deliverables = [d for d in all_proj_docs if d.doc_category == "DELIVERABLE"]
                 staff_drafts = [d for d in all_proj_docs if d.doc_category == "STAFF_DRAFT"]
-                is_fully_paid = (a.quoted_cost_kes > 0) and (a.amount_paid_kes >= a.quoted_cost_kes)
-                has_final_deliverable = len(client_deliverables) > 0
+                comm_info = compute_assignment_commission(db, a)
+                is_fully_paid = comm_info["is_paid"]
+                has_final_deliverable = comm_info["has_deliverable"]
 
                 biz_badge = f" [{proj_tenant.business_name}]" if current_user.role == "CLIENT" and proj_tenant else ""
                 with st.expander(f"**{a.ref_number}**{biz_badge} | {a.title} — `{a.status}` (Due: {a.deadline.strftime('%Y-%m-%d')})", expanded=True):
@@ -1106,6 +1180,16 @@ else:
                                         f"Balance `KES {balance:,.0f}`")
 
                             if current_user.role in ["TENANT_ADMIN", "STAFF"]:
+                                if a.staff_id:
+                                    pay_tag = (
+                                        f"✅ Paid (`{a.staff_payout_mpesa}`)" if comm_info["payout_status"] == "Paid"
+                                        else ("🟢 Earned & Payable" if comm_info["is_payable"] else "⏳ Pending Client Pay & Deliverable")
+                                    )
+                                    net_str = f" | Agency Net: `KES {comm_info['agency_net']:,.0f}`" if current_user.role == "TENANT_ADMIN" else ""
+                                    st.markdown(
+                                        f"**Staff Commission ({comm_info['commission_pct']:.0f}%):** "
+                                        f"`KES {comm_info['staff_earnings']:,.0f}` ({pay_tag}){net_str}"
+                                    )
                                 pay_icon = "✅" if is_fully_paid else "⏳"
                                 deliv_icon = "✅" if has_final_deliverable else "⏳"
                                 st.caption(f"**Closure Checklist:** {pay_icon} Full Payment Confirmed | {deliv_icon} Final Deliverable Released to Client ({len(client_deliverables)}) | Staff Drafts ({len(staff_drafts)})")
@@ -1123,10 +1207,12 @@ else:
                                     staff_names = ["Unassigned"] + [s.full_name for s in staff_members]
                                     curr_idx = staff_names.index(staff_obj.full_name) if staff_obj else 0
                                     sel_staff = st.selectbox("Assign Staff", staff_names, index=curr_idx, key=f"sf_{a.id}")
-                                    new_q = st.number_input("Quoted Cost (KES)", value=float(a.quoted_cost_kes), step=500.0, key=f"q_{a.id}")
+                                    default_pct_val = float(getattr(a, "staff_commission_pct", 50.0) or 50.0)
+                                    c_q1, c_q2 = st.columns(2)
+                                    new_q = c_q1.number_input("Quoted Cost (KES)", value=float(a.quoted_cost_kes), step=500.0, key=f"q_{a.id}")
+                                    new_comm_pct = c_q2.number_input("Staff Share (%)", min_value=0.0, max_value=100.0, value=default_pct_val, step=5.0, key=f"cp_{a.id}")
 
                                 if st.button("Save Project Changes", key=f"upd_{a.id}", type="primary"):
-                                    # Gate 4: Block closing/completing unless payment is confirmed AND final deliverable is submitted
                                     if new_st in CLOSURE_STATUSES and (not is_fully_paid or not has_final_deliverable):
                                         missing_reasons = []
                                         if not is_fully_paid:
@@ -1147,8 +1233,19 @@ else:
                                             if new_sid != a.staff_id:
                                                 changes.append(f"Assigned to {sel_staff}")
                                                 a.staff_id = new_sid
+                                                if chosen:
+                                                    # Inherit staff member's default commission rate if not explicitly changed
+                                                    staff_def_rate = float(getattr(chosen, "commission_rate", 50.0) or 50.0)
+                                                    if new_comm_pct == default_pct_val:
+                                                        a.staff_commission_pct = staff_def_rate
+                                                    else:
+                                                        a.staff_commission_pct = new_comm_pct
                                                 if a.status in ["1. Submitted", "5. Payment confirmed"] and new_sid is not None:
                                                     a.status = "6. Assigned"
+                                            elif new_comm_pct != default_pct_val:
+                                                a.staff_commission_pct = new_comm_pct
+                                                changes.append(f"Staff commission set to {new_comm_pct:.0f}%")
+
                                             if new_q != a.quoted_cost_kes:
                                                 changes.append(f"Quote updated to KES {new_q:,.0f}")
                                                 a.quoted_cost_kes = new_q
@@ -1171,7 +1268,6 @@ else:
                                         else:
                                             st.info("No new changes detected.")
                             else:
-                                # Client actions: Approve work or request revision when deliverable is awaiting client feedback
                                 if a.status in ["8. Awaiting client feedback", "9. Awaiting client feedback"]:
                                     c_b1, c_b2 = st.columns(2)
                                     if c_b1.button("✅ Approve Work", key=f"app_{a.id}", type="primary"):
@@ -1307,7 +1403,6 @@ else:
                                         st.rerun()
 
                     with sub_t3:
-                        # Requirement 3: Staff downloads client brief, uploads STAFF_DRAFT to Admin; Admin approves & submits DELIVERABLE to Client
                         visible_docs = [
                             d for d in all_proj_docs
                             if current_user.role in ["TENANT_ADMIN", "STAFF"] or d.doc_category != "STAFF_DRAFT"
@@ -1326,7 +1421,6 @@ else:
                                 with open(d.file_path, "rb") as fp:
                                     dc2.download_button("⬇️ Download", data=fp.read(),
                                                         file_name=d.original_filename, key=f"dl_{d.id}")
-                            # Tenant Admin one-click button to promote a Staff Draft into a Client Deliverable
                             if current_user.role == "TENANT_ADMIN" and d.doc_category == "STAFF_DRAFT":
                                 if dc3.button("🚀 Approve & Send to Client", key=f"prom_{d.id}", type="primary"):
                                     d.doc_category = "DELIVERABLE"
@@ -1408,7 +1502,6 @@ else:
                                 st.rerun()
 
                     with sub_t4:
-                        # Requirement 3: Separate Client Chat vs Internal Staff <-> Admin Collaboration Channel
                         all_msgs = db.query(AssignmentMessage).filter_by(tenant_id=a.tenant_id, assignment_id=a.id).order_by(AssignmentMessage.sent_at.asc()).all()
                         client_msgs = [m for m in all_msgs if getattr(m, "channel", "CLIENT_CHAT") != "INTERNAL_STAFF_ADMIN"]
                         internal_msgs = [m for m in all_msgs if getattr(m, "channel", "CLIENT_CHAT") == "INTERNAL_STAFF_ADMIN"]
@@ -1498,7 +1591,6 @@ else:
                 selected_t_lbl = st.selectbox("1. Choose Academic / Research Consultancy for This Project", list(tenant_choices.keys()))
                 chosen_tenant, chosen_metrics = tenant_choices[selected_t_lbl]
 
-                # Public Consultancy Profile, Turnaround Time & Client Reviews Card
                 with st.container(border=True):
                     p1, p2, p3 = st.columns(3)
                     p1.metric("Consultancy", chosen_tenant.business_name)
@@ -1632,7 +1724,7 @@ else:
                         st.rerun()
 
         with tabs[3]:
-            st.subheader("Client Financials & Daraja API Configuration (Ledger 2)")
+            st.subheader("Client Financials, Staff Payroll & Daraja Configuration (Ledger 2)")
             with st.form("mpesa_cfg_form"):
                 c1, c2 = st.columns(2)
                 c_pb = c1.text_input("Your Business M-Pesa Paybill / Till", value=tenant.mpesa_paybill)
@@ -1649,12 +1741,78 @@ else:
                     db.commit()
                     st.success("Payment & Daraja settings updated!")
 
-            fin_rows = [{
-                "Ref #": a.ref_number, "Invoice #": a.invoice_number, "Project": a.title,
-                "Quoted (KES)": a.quoted_cost_kes, "Paid (KES)": a.amount_paid_kes,
-                "Balance (KES)": max(0.0, a.quoted_cost_kes - a.amount_paid_kes),
-                "Status": a.status
-            } for a in assignments]
+            st.divider()
+            st.markdown("### 💸 Staff Payroll / M-Pesa Payouts")
+            staff_assignments = [a for a in assignments if a.staff_id is not None]
+            if not staff_assignments:
+                st.caption("No projects have been assigned to staff yet.")
+            else:
+                payroll_rows = []
+                payable_list = []
+                for sa_a in staff_assignments:
+                    st_u = db.query(User).filter_by(id=sa_a.staff_id).first()
+                    ci = compute_assignment_commission(db, sa_a)
+                    eligibility = (
+                        "✅ Paid" if ci["payout_status"] == "Paid"
+                        else ("🟢 Ready for Payout" if ci["is_payable"] else "⏳ Awaiting Client Pay / Deliverable")
+                    )
+                    payroll_rows.append({
+                        "Ref #": sa_a.ref_number,
+                        "Staff Member": st_u.full_name if st_u else "Unknown",
+                        "Quoted (KES)": sa_a.quoted_cost_kes,
+                        "Share (%)": f"{ci['commission_pct']:.0f}%",
+                        "Staff Earnings (KES)": ci["staff_earnings"],
+                        "Agency Net (KES)": ci["agency_net"],
+                        "Payout Status": eligibility,
+                        "Payout M-Pesa Ref": getattr(sa_a, "staff_payout_mpesa", "") or "-"
+                    })
+                    if ci["is_payable"]:
+                        payable_list.append((sa_a, st_u, ci))
+
+                st.dataframe(pd.DataFrame(payroll_rows), use_container_width=True)
+
+                if payable_list:
+                    st.markdown("**Disburse Earned Staff Payouts:**")
+                    for pay_a, pay_u, pay_ci in payable_list:
+                        pc1, pc2, pc3 = st.columns([2.2, 1.3, 1])
+                        pc1.write(
+                            f"• **{pay_u.full_name if pay_u else 'Staff'}** — `{pay_a.ref_number}` ({pay_a.title[:35]}) | "
+                            f"**KES {pay_ci['staff_earnings']:,.0f}** ({pay_ci['commission_pct']:.0f}%)"
+                        )
+                        mp_ref = pc2.text_input("M-Pesa Payout Receipt", placeholder="e.g. SL99PAY01", key=f"sp_ref_{pay_a.id}")
+                        if pc3.button("💸 Mark Payout as Paid", key=f"sp_btn_{pay_a.id}", type="primary"):
+                            receipt_str = mp_ref.strip().upper() or f"MANUAL-{utc_now().strftime('%Y%m%d%H%M')}"
+                            pay_a.staff_payout_status = "Paid"
+                            pay_a.staff_payout_mpesa = receipt_str
+                            pay_a.staff_paid_at = utc_now()
+                            db.add(AssignmentLog(
+                                tenant_id=tid, assignment_id=pay_a.id,
+                                actor_name=current_user.full_name,
+                                action_note=f"Marked staff payout of KES {pay_ci['staff_earnings']:,.0f} to {pay_u.full_name if pay_u else 'Staff'} as Paid (Ref: {receipt_str})."
+                            ))
+                            if pay_u and pay_u.email:
+                                dispatch_email_notification(
+                                    db, tid, pay_u.email,
+                                    f"[{tenant.business_name}] Staff Payout Sent: KES {pay_ci['staff_earnings']:,.0f} ({pay_a.ref_number})",
+                                    f"Hello {pay_u.full_name},\n\nYour commission payout of KES {pay_ci['staff_earnings']:,.0f} ({pay_ci['commission_pct']:.0f}%) for '{pay_a.title}' ({pay_a.ref_number}) has been marked as Paid (Ref: {receipt_str})."
+                                )
+                            db.commit()
+                            st.success(f"Payout recorded ({receipt_str}) and staff notified!")
+                            st.rerun()
+
+            st.divider()
+            st.markdown("### 📊 Project Revenue & Agency Net Margin Ledger")
+            fin_rows = []
+            for a in assignments:
+                ci = compute_assignment_commission(db, a)
+                fin_rows.append({
+                    "Ref #": a.ref_number, "Invoice #": a.invoice_number, "Project": a.title,
+                    "Quoted (KES)": a.quoted_cost_kes, "Paid (KES)": a.amount_paid_kes,
+                    "Balance (KES)": max(0.0, a.quoted_cost_kes - a.amount_paid_kes),
+                    "Staff Share (KES)": ci["staff_earnings"],
+                    "Agency Net (KES)": ci["agency_net"],
+                    "Status": a.status
+                })
             st.dataframe(pd.DataFrame(fin_rows), use_container_width=True)
 
         with tabs[4]:
@@ -1664,7 +1822,27 @@ else:
                         f"Active Projects: **{active_tenant_projects_count} / {current_plan.max_active_projects}**")
 
             t_users = db.query(User).filter_by(tenant_id=tid).all()
-            st.dataframe(pd.DataFrame([{"Name": u.full_name, "Email": u.email, "Role": u.role} for u in t_users]), use_container_width=True)
+            st.dataframe(pd.DataFrame([{
+                "Name": u.full_name,
+                "Email": u.email,
+                "Role": u.role,
+                "Default Commission (%)": f"{getattr(u, 'commission_rate', 50.0):.0f}%" if u.role == "STAFF" else "-"
+            } for u in t_users]), use_container_width=True)
+
+            # Quick default commission rate editor for existing staff
+            only_staff = [u for u in t_users if u.role == "STAFF"]
+            if only_staff:
+                with st.expander("⚙️ Adjust Default Commission Rate for Existing Staff"):
+                    ec1, ec2, ec3 = st.columns([2, 1.2, 1])
+                    s_map = {f"{u.full_name} ({getattr(u, 'commission_rate', 50.0):.0f}%)": u for u in only_staff}
+                    chosen_s_lbl = ec1.selectbox("Select Staff Member", list(s_map.keys()), key="edit_st_rate_sel")
+                    target_st_u = s_map[chosen_s_lbl]
+                    updated_rate = ec2.number_input("New Default Rate (%)", min_value=0.0, max_value=100.0, value=float(getattr(target_st_u, "commission_rate", 50.0) or 50.0), step=5.0, key="edit_st_rate_val")
+                    if ec3.button("Save Rate", key="edit_st_rate_btn"):
+                        target_st_u.commission_rate = updated_rate
+                        db.commit()
+                        st.success(f"Updated {target_st_u.full_name}'s default rate to {updated_rate:.0f}%!")
+                        st.rerun()
 
             col_staff, col_saas, col_sup = st.columns([1, 1.3, 1.1])
             with col_staff:
@@ -1672,6 +1850,7 @@ else:
                     st.markdown("**Add Staff / Researcher**")
                     st_name = st.text_input("Staff Full Name")
                     st_email = st.text_input("Staff Email")
+                    st_rate = st.number_input("Default Commission Share (%)", min_value=0.0, max_value=100.0, value=50.0, step=5.0)
                     st_pass = st.text_input("Temporary Password", type="password")
                     if st.form_submit_button("Add Staff Member") and st_name and st_email and st_pass:
                         if current_plan and len(staff_members) >= current_plan.max_staff:
@@ -1679,18 +1858,20 @@ else:
                         elif db.query(User).filter_by(email=st_email.strip()).first():
                             st.error("User with this email already exists.")
                         else:
-                            new_staff = User(tenant_id=tid, full_name=st_name.strip(), email=st_email.strip(),
-                                             password_hash=hash_password(st_pass), role="STAFF")
+                            new_staff = User(
+                                tenant_id=tid, full_name=st_name.strip(), email=st_email.strip(),
+                                password_hash=hash_password(st_pass), role="STAFF", commission_rate=st_rate
+                            )
                             db.add(new_staff)
                             notify_all_stakeholders(
                                 db, tid, None,
                                 f"[{tenant.business_name}] New Staff Added: {new_staff.full_name}",
-                                f"Staff member {new_staff.full_name} ({new_staff.email}) was added to {tenant.business_name}."
+                                f"Staff member {new_staff.full_name} ({new_staff.email}, {st_rate:.0f}% commission) was added to {tenant.business_name}."
                             )
                             dispatch_email_notification(
                                 db, tid, new_staff.email,
                                 f"Welcome to {tenant.business_name} on AcadFlow",
-                                f"Hello {new_staff.full_name}, you have been added as Staff on {tenant.business_name}. Log in with your email and temporary password."
+                                f"Hello {new_staff.full_name}, you have been added as Staff on {tenant.business_name} with a {st_rate:.0f}% project commission rate. Log in with your email and temporary password."
                             )
                             db.commit()
                             st.rerun()
@@ -1717,7 +1898,6 @@ else:
                         st.success("Support ticket sent to Super Admin!")
                         st.rerun()
 
-                # Requirement 2: Tenant view of their support tickets & Super Admin responses
                 my_tickets = db.query(SupportTicket).filter_by(tenant_id=tid).order_by(SupportTicket.created_at.desc()).all()
                 if my_tickets:
                     st.markdown("**My Support Tickets & Super Admin Replies:**")
