@@ -58,11 +58,15 @@ ASSIGNMENT_STATUSES = [
     "5. Payment confirmed",
     "6. Assigned",
     "7. In progress",
-    "8. Awaiting client feedback",
-    "9. Revision requested",
-    "10. Completed",
-    "11. Closed"
+    "8. Internal review (Staff -> Admin)",
+    "9. Awaiting client feedback",
+    "10. Revision requested",
+    "11. Completed",
+    "12. Closed"
 ]
+
+COMPLETED_STATUSES = ["10. Completed", "11. Completed", "11. Closed", "12. Closed"]
+CLOSURE_STATUSES = ["10. Completed", "11. Completed", "11. Closed", "12. Closed"]
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -164,7 +168,7 @@ class AssignmentDocument(Base):
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
     assignment_id = Column(Integer, ForeignKey("assignments.id"), nullable=False)
     uploaded_by_name = Column(String, nullable=False)
-    doc_category = Column(String, nullable=False)
+    doc_category = Column(String, nullable=False)  # CLIENT_BRIEF, STAFF_DRAFT, DELIVERABLE
     original_filename = Column(String, nullable=False)
     file_hash = Column(String, nullable=False)
     file_path = Column(String, nullable=False)
@@ -177,6 +181,7 @@ class AssignmentMessage(Base):
     assignment_id = Column(Integer, ForeignKey("assignments.id"), nullable=False)
     sender_name = Column(String, nullable=False)
     sender_role = Column(String, nullable=False)
+    channel = Column(String, default="CLIENT_CHAT")  # CLIENT_CHAT or INTERNAL_STAFF_ADMIN
     message_text = Column(Text, nullable=False)
     sent_at = Column(DateTime, default=utc_now)
 
@@ -256,16 +261,54 @@ try:
                 conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN checkout_request_id VARCHAR"))
             if "phone_number" not in ps_cols:
                 conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN phone_number VARCHAR"))
+            am_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(assignment_messages)")).fetchall()]
+            if "channel" not in am_cols:
+                conn.execute(text("ALTER TABLE assignment_messages ADD COLUMN channel VARCHAR DEFAULT 'CLIENT_CHAT'"))
         else:
             conn.execute(text("ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS checkout_request_id VARCHAR;"))
             conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN IF NOT EXISTS checkout_request_id VARCHAR;"))
             conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN IF NOT EXISTS phone_number VARCHAR;"))
+            conn.execute(text("ALTER TABLE assignment_messages ADD COLUMN IF NOT EXISTS channel VARCHAR DEFAULT 'CLIENT_CHAT';"))
 except Exception:
     pass
 
 # ==========================================
-# 3. EMAIL, PDF & DARAJA SERVICES
+# 3. TENANT REPUTATION, TURNAROUND & EMAIL SERVICES
 # ==========================================
+def get_tenant_public_metrics(db, tenant_id: int) -> dict:
+    """Computes public rating, review count, and turnaround time (actual completed or catalogue average)."""
+    reviews = db.query(ClientReview).filter_by(tenant_id=tenant_id).all()
+    review_count = len(reviews)
+    avg_rating = round(sum(r.rating for r in reviews) / review_count, 1) if review_count else 0.0
+
+    completed = db.query(Assignment).filter(
+        Assignment.tenant_id == tenant_id,
+        Assignment.completed_at.isnot(None),
+        Assignment.created_at.isnot(None)
+    ).all()
+
+    if completed:
+        total_days = sum(max(0.2, (a.completed_at - a.created_at).total_seconds() / 86400.0) for a in completed)
+        avg_turnaround_days = round(total_days / len(completed), 1)
+        turnaround_label = f"{avg_turnaround_days} days (Verified Avg across {len(completed)} orders)"
+    else:
+        srvs = db.query(Service).filter_by(tenant_id=tenant_id).all()
+        if srvs:
+            avg_turnaround_days = round(sum(s.turnaround_days for s in srvs) / len(srvs), 1)
+            turnaround_label = f"~{avg_turnaround_days} days (Service Catalogue Est.)"
+        else:
+            avg_turnaround_days = None
+            turnaround_label = "Not yet listed"
+
+    return {
+        "avg_rating": avg_rating,
+        "review_count": review_count,
+        "reviews": reviews,
+        "avg_turnaround_days": avg_turnaround_days,
+        "turnaround_label": turnaround_label,
+        "completed_count": len(completed),
+    }
+
 def dispatch_email_notification(db, tenant_id: int | None, recipient: str, subject: str, body: str):
     """Sends real SMTP email (port 587 STARTTLS or 465 SSL) and records an auditable log."""
     smtp_host = get_secret("SMTP_HOST")
@@ -299,8 +342,8 @@ def dispatch_email_notification(db, tenant_id: int | None, recipient: str, subje
         subject=subject, body=body, delivery_status=status
     ))
 
-def notify_all_stakeholders(db, tenant_id: int | None, assignment: Assignment | None, subject: str, body: str):
-    """Broadcasts notifications to Client, Assigned Staff, Tenant Admins, and Super Admin."""
+def notify_all_stakeholders(db, tenant_id: int | None, assignment: Assignment | None, subject: str, body: str, include_client: bool = True):
+    """Broadcasts notifications to Client (optional for internal chats), Assigned Staff, Tenant Admins, and Super Admin."""
     recipients = set()
 
     configured_super = get_secret("SUPER_ADMIN_EMAIL")
@@ -316,7 +359,7 @@ def notify_all_stakeholders(db, tenant_id: int | None, assignment: Assignment | 
                 recipients.add(admin.email.strip().lower())
 
     if assignment is not None:
-        if assignment.client_id:
+        if include_client and assignment.client_id:
             client_u = db.query(User).filter_by(id=assignment.client_id).first()
             if client_u and client_u.email:
                 recipients.add(client_u.email.strip().lower())
@@ -614,44 +657,46 @@ if not current_user:
 
         with auth_tab2:
             st.subheader("Create a Client Account")
+            st.caption("Once registered, you can submit projects to any verified consultancy on AcadFlow.")
             active_tenants = db.query(Tenant).filter(Tenant.status.in_(["Active", "Trial"])).all()
-            if not active_tenants:
-                st.info("No active consultancies are accepting public registrations yet.")
-            else:
-                with st.form("client_reg_form"):
+            with st.form("client_reg_form"):
+                default_tid = active_tenants[0].id if active_tenants else None
+                if active_tenants:
                     t_map = {t.business_name: t.id for t in active_tenants}
-                    chosen_biz = st.selectbox("Select Academic / Research Consultancy", list(t_map.keys()))
-                    c_name = st.text_input("Your Full Name")
-                    c_email = st.text_input("Email Address")
-                    c_pass = st.text_input("Create Password", type="password")
-                    if st.form_submit_button("Register as Client", type="primary"):
-                        if c_name and c_email and c_pass:
-                            if db.query(User).filter_by(email=c_email.strip()).first():
-                                st.error("An account with this email already exists.")
-                            else:
-                                selected_tid = t_map[chosen_biz]
-                                new_client = User(
-                                    tenant_id=selected_tid,
-                                    full_name=c_name.strip(),
-                                    email=c_email.strip(),
-                                    password_hash=hash_password(c_pass),
-                                    role="CLIENT"
-                                )
-                                db.add(new_client)
-                                db.commit()
-                                notify_all_stakeholders(
-                                    db, selected_tid, None,
-                                    f"[AcadFlow] New Client Registered: {new_client.full_name} ({chosen_biz})",
-                                    f"Client {new_client.full_name} ({new_client.email}) joined {chosen_biz}."
-                                )
-                                dispatch_email_notification(
-                                    db, selected_tid, new_client.email,
-                                    f"Welcome to {chosen_biz} on AcadFlow",
-                                    f"Hello {new_client.full_name}, your client account for {chosen_biz} is active."
-                                )
-                                db.commit()
-                                st.session_state.user_id = new_client.id
-                                st.rerun()
+                    chosen_biz = st.selectbox("Primary Consultancy (You can switch anytime per project)", list(t_map.keys()))
+                    default_tid = t_map[chosen_biz]
+                else:
+                    chosen_biz = "AcadFlow Marketplace"
+                c_name = st.text_input("Your Full Name")
+                c_email = st.text_input("Email Address")
+                c_pass = st.text_input("Create Password", type="password")
+                if st.form_submit_button("Register as Client", type="primary"):
+                    if c_name and c_email and c_pass:
+                        if db.query(User).filter_by(email=c_email.strip()).first():
+                            st.error("An account with this email already exists.")
+                        else:
+                            new_client = User(
+                                tenant_id=default_tid,
+                                full_name=c_name.strip(),
+                                email=c_email.strip(),
+                                password_hash=hash_password(c_pass),
+                                role="CLIENT"
+                            )
+                            db.add(new_client)
+                            db.commit()
+                            notify_all_stakeholders(
+                                db, default_tid, None,
+                                f"[AcadFlow] New Client Registered: {new_client.full_name}",
+                                f"Client {new_client.full_name} ({new_client.email}) registered on AcadFlow."
+                            )
+                            dispatch_email_notification(
+                                db, default_tid, new_client.email,
+                                "Welcome to AcadFlow",
+                                f"Hello {new_client.full_name}, your AcadFlow client account is active. You can compare consultancies and submit projects anytime."
+                            )
+                            db.commit()
+                            st.session_state.user_id = new_client.id
+                            st.rerun()
 
         with auth_tab3:
             st.subheader("Start Your 14-Day Free Trial")
@@ -715,7 +760,9 @@ tenant = db.query(Tenant).filter_by(id=current_user.tenant_id).first() if curren
 
 with st.sidebar:
     st.markdown("## 🎓 AcadFlow")
-    if tenant:
+    if current_user.role == "CLIENT":
+        st.info("**Mode:** Client Marketplace Portal\n\nSubmit projects to any active consultancy.")
+    elif tenant:
         st.success(f"**Workspace:** {tenant.business_name}\n\n**Plan:** {tenant.tier} ({tenant.status})")
     else:
         st.warning("**Mode:** Central Platform Control (Super Admin)")
@@ -758,11 +805,20 @@ if current_user.role == "SUPER_ADMIN":
     plans = db.query(SubscriptionPlan).all()
     total_saas_rev = sum(p.amount_kes for p in sub_payments if p.status == "Verified")
 
-    m1, m2, m3, m4 = st.columns(4)
+    all_completed_global = db.query(Assignment).filter(Assignment.completed_at.isnot(None)).all()
+    if all_completed_global:
+        global_ta = round(sum(max(0.2, (a.completed_at - a.created_at).total_seconds() / 86400.0) for a in all_completed_global) / len(all_completed_global), 1)
+        global_ta_str = f"{global_ta} days"
+    else:
+        all_srvs = db.query(Service).all()
+        global_ta_str = f"~{round(sum(s.turnaround_days for s in all_srvs) / len(all_srvs), 1)} days" if all_srvs else "N/A"
+
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Registered Businesses", len(tenants))
-    m2.metric("Active / Trial Workspaces", sum(1 for t in tenants if t.status in ["Active", "Trial"]))
+    m2.metric("Active / Trial", sum(1 for t in tenants if t.status in ["Active", "Trial"]))
     m3.metric("Verified SaaS Revenue", f"KES {total_saas_rev:,.0f}")
     m4.metric("Total Platform Projects", db.query(Assignment).count())
+    m5.metric("Platform Avg Turnaround", global_ta_str)
 
     sa_tabs = st.tabs([
         "🏢 Subscribing Businesses",
@@ -778,10 +834,12 @@ if current_user.role == "SUPER_ADMIN":
         for t in tenants:
             t_assign_count = db.query(Assignment).filter_by(tenant_id=t.id).count()
             t_staff_count = db.query(User).filter(User.tenant_id == t.id, User.role.in_(["TENANT_ADMIN", "STAFF"])).count()
-            with st.expander(f"{t.business_name} — [{t.tier}] — Status: {t.status}", expanded=True):
-                c1, c2, c3, c4 = st.columns([2, 1, 1.2, 1.3])
-                c1.write(f"**Paybill/Till:** {t.mpesa_paybill} ({t.mpesa_account})")
-                c2.write(f"**Staff:** {t_staff_count} | **Projects:** {t_assign_count}")
+            t_metrics = get_tenant_public_metrics(db, t.id)
+            rating_str = f"{t_metrics['avg_rating']} ⭐ ({t_metrics['review_count']})" if t_metrics["review_count"] else "No reviews"
+            with st.expander(f"{t.business_name} — [{t.tier}] — Status: {t.status} | ⏱️ {t_metrics['turnaround_label']} | {rating_str}", expanded=True):
+                c1, c2, c3, c4 = st.columns([2, 1.3, 1.1, 1.1])
+                c1.write(f"**Paybill/Till:** {t.mpesa_paybill} ({t.mpesa_account})  \n**Public Turnaround:** {t_metrics['turnaround_label']}")
+                c2.write(f"**Staff:** {t_staff_count} | **Projects:** {t_assign_count}  \n**Rating:** {rating_str}")
                 tier_names = [p.name for p in plans]
                 tier_idx = tier_names.index(t.tier) if t.tier in tier_names else 0
                 new_tier = c3.selectbox("Subscription Tier", tier_names, index=tier_idx, key=f"tr_{t.id}")
@@ -837,7 +895,6 @@ if current_user.role == "SUPER_ADMIN":
         } for p in sub_payments])
         st.dataframe(df_subs, use_container_width=True)
 
-        # Manual verify fallback for pending subscription payments
         pending_subs = [p for p in sub_payments if p.status != "Verified"]
         if pending_subs:
             st.markdown("**Pending Subscription Payments**")
@@ -902,12 +959,12 @@ if current_user.role == "SUPER_ADMIN":
         } for l in logs]), use_container_width=True)
 
 # ==========================================
-# 9. TENANT WORKSPACE (ADMIN / STAFF / CLIENT)
+# 9. WORKSPACE / CLIENT MARKETPLACE (ADMIN / STAFF / CLIENT)
 # ==========================================
 else:
     tid = current_user.tenant_id
 
-    def render_subscription_stk_box():
+    def render_subscription_stk_box(target_tenant: Tenant):
         st.subheader("📲 Upgrade / Renew AcadFlow Subscription (M-Pesa STK Push)")
         all_plans = db.query(SubscriptionPlan).all()
         plan_opts = {f"{p.name} — KES {p.monthly_price_kes:,.0f}/mo ({p.max_staff} staff, {p.max_active_projects} projects)": p for p in all_plans}
@@ -921,11 +978,11 @@ else:
                     st.error("Please enter a valid M-Pesa phone number.")
                 else:
                     chosen_p = plan_opts[chosen_p_lbl]
-                    res = trigger_platform_subscription_stk(sub_phone, int(chosen_p.monthly_price_kes), f"SUB-{tenant.id}")
+                    res = trigger_platform_subscription_stk(sub_phone, int(chosen_p.monthly_price_kes), f"SUB-{target_tenant.id}")
                     chk_id = res.get("CheckoutRequestID", "")
                     if chk_id:
                         db.add(PlatformSubscriptionPayment(
-                            tenant_id=tid,
+                            tenant_id=target_tenant.id,
                             checkout_request_id=chk_id,
                             plan_name=chosen_p.name,
                             amount_kes=chosen_p.monthly_price_kes,
@@ -934,9 +991,9 @@ else:
                             status="Pending Verification"
                         ))
                         notify_all_stakeholders(
-                            db, tid, None,
-                            f"[AcadFlow] Subscription STK Push Initiated: {tenant.business_name} ({chosen_p.name})",
-                            f"{tenant.business_name} initiated an M-Pesa STK Push of KES {chosen_p.monthly_price_kes:,.0f} for the {chosen_p.name} plan (CheckoutID: {chk_id})."
+                            db, target_tenant.id, None,
+                            f"[AcadFlow] Subscription STK Push Initiated: {target_tenant.business_name} ({chosen_p.name})",
+                            f"{target_tenant.business_name} initiated an M-Pesa STK Push of KES {chosen_p.monthly_price_kes:,.0f} for the {chosen_p.name} plan (CheckoutID: {chk_id})."
                         )
                         db.commit()
                     st.info(res.get("CustomerMessage", "STK Push sent! Enter your M-Pesa PIN to activate your plan automatically."))
@@ -944,18 +1001,18 @@ else:
             if st.button("🔄 Refresh Plan Status", key="sub_refresh_btn", use_container_width=True):
                 st.rerun()
 
-        recent_subs = db.query(PlatformSubscriptionPayment).filter_by(tenant_id=tid).order_by(PlatformSubscriptionPayment.paid_at.desc()).limit(4).all()
+        recent_subs = db.query(PlatformSubscriptionPayment).filter_by(tenant_id=target_tenant.id).order_by(PlatformSubscriptionPayment.paid_at.desc()).limit(4).all()
         if recent_subs:
             st.markdown("**Recent Subscription Transactions:**")
             for sp in recent_subs:
                 chk_display = f" | CheckoutID: `{sp.checkout_request_id}`" if getattr(sp, "checkout_request_id", "") else ""
                 st.caption(f"• **{sp.plan_name}** | KES {sp.amount_kes:,.0f} | Status: `{sp.status}` | Ref: `{sp.mpesa_code}`{chk_display}")
 
-    # If workspace is Suspended or Expired, let Tenant Admin pay via STK Push to reactivate automatically
-    if tenant.status in ["Suspended", "Expired"]:
+    # Enforce active subscription only for Tenant Admin / Staff (Clients can pick any active tenant)
+    if current_user.role in ["TENANT_ADMIN", "STAFF"] and tenant and tenant.status in ["Suspended", "Expired"]:
         st.error(f"⛔ This workspace is currently **{tenant.status}**. Complete a subscription payment below to reactivate automatically.")
         if current_user.role == "TENANT_ADMIN":
-            render_subscription_stk_box()
+            render_subscription_stk_box(tenant)
         else:
             st.info("Please ask your Workspace Administrator to renew the AcadFlow subscription.")
         st.stop()
@@ -964,21 +1021,22 @@ else:
     for ann in active_anns[:1]:
         st.info(f"📢 **{ann.title}:** {ann.message}")
 
-    st.title(f"🏢 {tenant.business_name}")
-
-    current_plan = db.query(SubscriptionPlan).filter_by(name=tenant.tier).first()
-    all_tenant_assignments = db.query(Assignment).filter(Assignment.tenant_id == tid).all()
-    active_tenant_projects_count = sum(1 for a in all_tenant_assignments if a.status not in ["10. Completed", "11. Closed"])
-    staff_members = db.query(User).filter(User.tenant_id == tid, User.role.in_(["TENANT_ADMIN", "STAFF"])).all()
-
-    assignments_q = db.query(Assignment).filter(Assignment.tenant_id == tid)
     if current_user.role == "CLIENT":
-        assignments_q = assignments_q.filter(Assignment.client_id == current_user.id)
-    elif current_user.role == "STAFF":
-        assignments_q = assignments_q.filter(Assignment.staff_id == current_user.id)
+        st.title("🎓 Client Project Hub & Consultancy Directory")
+        assignments_q = db.query(Assignment).filter(Assignment.client_id == current_user.id)
+    else:
+        st.title(f"🏢 {tenant.business_name}")
+        assignments_q = db.query(Assignment).filter(Assignment.tenant_id == tid)
+        if current_user.role == "STAFF":
+            assignments_q = assignments_q.filter(Assignment.staff_id == current_user.id)
 
     assignments = assignments_q.order_by(Assignment.created_at.desc()).all()
-    services = db.query(Service).filter(Service.tenant_id == tid).all()
+
+    current_plan = db.query(SubscriptionPlan).filter_by(name=tenant.tier).first() if tenant else None
+    all_tenant_assignments = db.query(Assignment).filter(Assignment.tenant_id == tid).all() if tid else []
+    active_tenant_projects_count = sum(1 for a in all_tenant_assignments if a.status not in COMPLETED_STATUSES)
+    staff_members = db.query(User).filter(User.tenant_id == tid, User.role.in_(["TENANT_ADMIN", "STAFF"])).all() if tid else []
+    services = db.query(Service).filter(Service.tenant_id == tid).all() if tid else []
 
     if current_user.role == "TENANT_ADMIN":
         tabs = st.tabs([
@@ -991,14 +1049,14 @@ else:
     elif current_user.role == "STAFF":
         tabs = st.tabs(["📋 My Assigned Projects"])
     else:
-        tabs = st.tabs(["📂 My Projects", "➕ Submit New Request"])
+        tabs = st.tabs(["📂 My Projects (All Consultancies)", "➕ Submit New Request & Compare Consultancies"])
 
     # --- TAB 1: ASSIGNMENTS, PDF INVOICES, M-PESA, FILES, MESSAGING & REVIEWS ---
     with tabs[0]:
         if current_user.role == "TENANT_ADMIN":
             total_rev = sum(a.amount_paid_kes for a in assignments)
             outstanding = sum(max(0, a.quoted_cost_kes - a.amount_paid_kes) for a in assignments)
-            overdue_cnt = sum(1 for a in assignments if a.deadline < utc_now() and a.status not in ["10. Completed", "11. Closed"])
+            overdue_cnt = sum(1 for a in assignments if a.deadline < utc_now() and a.status not in COMPLETED_STATUSES)
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Total Projects", len(assignments))
             c2.metric("Active Projects", f"{active_tenant_projects_count} / {current_plan.max_active_projects if current_plan else '∞'}")
@@ -1011,12 +1069,21 @@ else:
             st.info("No projects found in your view.")
         else:
             for a in assignments:
+                proj_tenant = db.query(Tenant).filter_by(id=a.tenant_id).first()
                 client_obj = db.query(User).filter_by(id=a.client_id).first()
                 staff_obj = db.query(User).filter_by(id=a.staff_id).first() if a.staff_id else None
                 srv_obj = db.query(Service).filter_by(id=a.service_id).first()
                 balance = max(0.0, a.quoted_cost_kes - a.amount_paid_kes)
 
-                with st.expander(f"**{a.ref_number}** | {a.title} — `{a.status}` (Due: {a.deadline.strftime('%Y-%m-%d')})", expanded=True):
+                # Check completion/closure prerequisites
+                all_proj_docs = db.query(AssignmentDocument).filter_by(tenant_id=a.tenant_id, assignment_id=a.id).all()
+                client_deliverables = [d for d in all_proj_docs if d.doc_category == "DELIVERABLE"]
+                staff_drafts = [d for d in all_proj_docs if d.doc_category == "STAFF_DRAFT"]
+                is_fully_paid = (a.quoted_cost_kes > 0) and (a.amount_paid_kes >= a.quoted_cost_kes)
+                has_final_deliverable = len(client_deliverables) > 0
+
+                biz_badge = f" [{proj_tenant.business_name}]" if current_user.role == "CLIENT" and proj_tenant else ""
+                with st.expander(f"**{a.ref_number}**{biz_badge} | {a.title} — `{a.status}` (Due: {a.deadline.strftime('%Y-%m-%d')})", expanded=True):
                     sub_t1, sub_t2, sub_t3, sub_t4, sub_t5 = st.tabs([
                         "📌 Overview & Controls",
                         "🧾 Quotation / Invoice & M-Pesa",
@@ -1028,6 +1095,8 @@ else:
                     with sub_t1:
                         col_info, col_manage = st.columns([1.4, 1])
                         with col_info:
+                            if proj_tenant:
+                                st.markdown(f"**Consultancy:** {proj_tenant.business_name}")
                             st.markdown(f"**Client:** {client_obj.full_name}  \n"
                                         f"**Assigned Staff:** {staff_obj.full_name if staff_obj else '_Unassigned_'}  \n"
                                         f"**Priority:** {a.priority}  \n"
@@ -1036,14 +1105,20 @@ else:
                                         f"Paid `KES {a.amount_paid_kes:,.0f}` | "
                                         f"Balance `KES {balance:,.0f}`")
 
+                            if current_user.role in ["TENANT_ADMIN", "STAFF"]:
+                                pay_icon = "✅" if is_fully_paid else "⏳"
+                                deliv_icon = "✅" if has_final_deliverable else "⏳"
+                                st.caption(f"**Closure Checklist:** {pay_icon} Full Payment Confirmed | {deliv_icon} Final Deliverable Released to Client ({len(client_deliverables)}) | Staff Drafts ({len(staff_drafts)})")
+
                             existing_rev = db.query(ClientReview).filter_by(assignment_id=a.id).first()
                             if existing_rev:
                                 st.success(f"⭐ **Client Rating:** {'⭐' * existing_rev.rating} ({existing_rev.rating}/5) — _{existing_rev.feedback}_")
 
                         with col_manage:
                             if current_user.role in ["TENANT_ADMIN", "STAFF"]:
-                                new_st = st.selectbox("Stage (1–11)", ASSIGNMENT_STATUSES,
-                                                      index=ASSIGNMENT_STATUSES.index(a.status), key=f"st_{a.id}")
+                                status_idx = ASSIGNMENT_STATUSES.index(a.status) if a.status in ASSIGNMENT_STATUSES else 0
+                                new_st = st.selectbox("Stage (1–12)", ASSIGNMENT_STATUSES,
+                                                      index=status_idx, key=f"st_{a.id}")
                                 if current_user.role == "TENANT_ADMIN":
                                     staff_names = ["Unassigned"] + [s.full_name for s in staff_members]
                                     curr_idx = staff_names.index(staff_obj.full_name) if staff_obj else 0
@@ -1051,88 +1126,101 @@ else:
                                     new_q = st.number_input("Quoted Cost (KES)", value=float(a.quoted_cost_kes), step=500.0, key=f"q_{a.id}")
 
                                 if st.button("Save Project Changes", key=f"upd_{a.id}", type="primary"):
-                                    changes = []
-                                    if new_st != a.status:
-                                        changes.append(f"Status: '{a.status}' -> '{new_st}'")
-                                        a.status = new_st
-                                        if new_st == "10. Completed":
-                                            a.completed_at = utc_now()
-                                    if current_user.role == "TENANT_ADMIN":
-                                        chosen = next((s for s in staff_members if s.full_name == sel_staff), None)
-                                        new_sid = chosen.id if chosen else None
-                                        if new_sid != a.staff_id:
-                                            changes.append(f"Assigned to {sel_staff}")
-                                            a.staff_id = new_sid
-                                            if a.status in ["1. Submitted", "5. Payment confirmed"] and new_sid is not None:
-                                                a.status = "6. Assigned"
-                                        if new_q != a.quoted_cost_kes:
-                                            changes.append(f"Quote updated to KES {new_q:,.0f}")
-                                            a.quoted_cost_kes = new_q
-
-                                    if changes:
-                                        summary_note = "; ".join(changes)
-                                        db.add(AssignmentLog(tenant_id=tid, assignment_id=a.id,
-                                                             actor_name=current_user.full_name, action_note=summary_note))
-                                        notify_all_stakeholders(
-                                            db, tid, a,
-                                            f"[{tenant.business_name}] Progress Update ({a.ref_number}): {a.status}",
-                                            f"Project: {a.title} ({a.ref_number})\n"
-                                            f"Updated by: {current_user.full_name}\n"
-                                            f"Changes: {summary_note}\n"
-                                            f"Current Stage: {a.status} | Quoted: KES {a.quoted_cost_kes:,.0f} | Paid: KES {a.amount_paid_kes:,.0f}"
-                                        )
-                                        db.commit()
-                                        st.success("Project updated and all stakeholders notified!")
-                                        st.rerun()
+                                    # Gate 4: Block closing/completing unless payment is confirmed AND final deliverable is submitted
+                                    if new_st in CLOSURE_STATUSES and (not is_fully_paid or not has_final_deliverable):
+                                        missing_reasons = []
+                                        if not is_fully_paid:
+                                            missing_reasons.append(f"full payment is not confirmed (Balance: KES {balance:,.0f})")
+                                        if not has_final_deliverable:
+                                            missing_reasons.append("no final deliverable has been submitted to the client yet")
+                                        st.error(f"⛔ Cannot mark project as **{new_st}** because " + " and ".join(missing_reasons) + ".")
                                     else:
-                                        st.info("No new changes detected.")
+                                        changes = []
+                                        if new_st != a.status:
+                                            changes.append(f"Status: '{a.status}' -> '{new_st}'")
+                                            a.status = new_st
+                                            if new_st in COMPLETED_STATUSES and not a.completed_at:
+                                                a.completed_at = utc_now()
+                                        if current_user.role == "TENANT_ADMIN":
+                                            chosen = next((s for s in staff_members if s.full_name == sel_staff), None)
+                                            new_sid = chosen.id if chosen else None
+                                            if new_sid != a.staff_id:
+                                                changes.append(f"Assigned to {sel_staff}")
+                                                a.staff_id = new_sid
+                                                if a.status in ["1. Submitted", "5. Payment confirmed"] and new_sid is not None:
+                                                    a.status = "6. Assigned"
+                                            if new_q != a.quoted_cost_kes:
+                                                changes.append(f"Quote updated to KES {new_q:,.0f}")
+                                                a.quoted_cost_kes = new_q
+
+                                        if changes:
+                                            summary_note = "; ".join(changes)
+                                            db.add(AssignmentLog(tenant_id=a.tenant_id, assignment_id=a.id,
+                                                                 actor_name=current_user.full_name, action_note=summary_note))
+                                            notify_all_stakeholders(
+                                                db, a.tenant_id, a,
+                                                f"[{proj_tenant.business_name}] Progress Update ({a.ref_number}): {a.status}",
+                                                f"Project: {a.title} ({a.ref_number})\n"
+                                                f"Updated by: {current_user.full_name}\n"
+                                                f"Changes: {summary_note}\n"
+                                                f"Current Stage: {a.status} | Quoted: KES {a.quoted_cost_kes:,.0f} | Paid: KES {a.amount_paid_kes:,.0f}"
+                                            )
+                                            db.commit()
+                                            st.success("Project updated and all stakeholders notified!")
+                                            st.rerun()
+                                        else:
+                                            st.info("No new changes detected.")
                             else:
-                                if a.status == "8. Awaiting client feedback":
+                                # Client actions: Approve work or request revision when deliverable is awaiting client feedback
+                                if a.status in ["8. Awaiting client feedback", "9. Awaiting client feedback"]:
                                     c_b1, c_b2 = st.columns(2)
                                     if c_b1.button("✅ Approve Work", key=f"app_{a.id}", type="primary"):
-                                        a.status = "10. Completed"
-                                        a.completed_at = utc_now()
-                                        db.add(AssignmentLog(tenant_id=tid, assignment_id=a.id,
-                                                             actor_name=current_user.full_name, action_note="Client approved final work."))
-                                        notify_all_stakeholders(
-                                            db, tid, a,
-                                            f"[{tenant.business_name}] Work Approved ({a.ref_number}): 10. Completed",
-                                            f"Client {current_user.full_name} approved final deliverables for '{a.title}' ({a.ref_number})."
-                                        )
-                                        db.commit()
-                                        st.rerun()
+                                        if not is_fully_paid or not has_final_deliverable:
+                                            st.error("Project cannot be completed until full payment is confirmed and final deliverable is uploaded.")
+                                        else:
+                                            a.status = "11. Completed"
+                                            a.completed_at = utc_now()
+                                            db.add(AssignmentLog(tenant_id=a.tenant_id, assignment_id=a.id,
+                                                                 actor_name=current_user.full_name, action_note="Client approved final work."))
+                                            notify_all_stakeholders(
+                                                db, a.tenant_id, a,
+                                                f"[{proj_tenant.business_name}] Work Approved ({a.ref_number}): 11. Completed",
+                                                f"Client {current_user.full_name} approved final deliverables for '{a.title}' ({a.ref_number})."
+                                            )
+                                            db.commit()
+                                            st.rerun()
                                     if c_b2.button("🔄 Request Revision", key=f"rev_{a.id}"):
-                                        a.status = "9. Revision requested"
-                                        db.add(AssignmentLog(tenant_id=tid, assignment_id=a.id,
+                                        a.status = "10. Revision requested"
+                                        db.add(AssignmentLog(tenant_id=a.tenant_id, assignment_id=a.id,
                                                              actor_name=current_user.full_name, action_note="Client requested revision."))
                                         notify_all_stakeholders(
-                                            db, tid, a,
-                                            f"[{tenant.business_name}] Revision Requested ({a.ref_number})",
+                                            db, a.tenant_id, a,
+                                            f"[{proj_tenant.business_name}] Revision Requested ({a.ref_number})",
                                             f"Client {current_user.full_name} requested a revision on '{a.title}' ({a.ref_number})."
                                         )
                                         db.commit()
                                         st.rerun()
 
-                                if a.status in ["10. Completed", "11. Closed"] and not existing_rev:
+                                if a.status in COMPLETED_STATUSES and not existing_rev:
                                     with st.form(f"rev_form_{a.id}"):
-                                        st.markdown("**Rate Our Service**")
+                                        st.markdown(f"**Rate {proj_tenant.business_name}**")
                                         stars = st.slider("Satisfaction Rating (1–5)", 1, 5, 5)
-                                        fb_text = st.text_input("Review Comment")
-                                        if st.form_submit_button("Submit Review"):
+                                        fb_text = st.text_input("Public Review Comment")
+                                        if st.form_submit_button("Publish Public Review"):
                                             db.add(ClientReview(
-                                                tenant_id=tid, assignment_id=a.id,
+                                                tenant_id=a.tenant_id, assignment_id=a.id,
                                                 client_name=current_user.full_name, rating=stars, feedback=fb_text
                                             ))
                                             notify_all_stakeholders(
-                                                db, tid, a,
-                                                f"[{tenant.business_name}] New Client Review ({stars}/5) - {a.ref_number}",
-                                                f"{current_user.full_name} rated '{a.title}' {stars}/5 stars: {fb_text}"
+                                                db, a.tenant_id, a,
+                                                f"[{proj_tenant.business_name}] New Client Review ({stars}/5) - {a.ref_number}",
+                                                f"{current_user.full_name} rated '{proj_tenant.business_name}' {stars}/5 stars: {fb_text}"
                                             )
                                             db.commit()
                                             st.rerun()
 
                     with sub_t2:
-                        pdf_bytes = generate_financial_pdf(tenant, a, client_obj, srv_obj.title if srv_obj else "Academic Service")
+                        pdf_bytes = generate_financial_pdf(proj_tenant, a, client_obj, srv_obj.title if srv_obj else "Academic Service")
                         pdf_label = "📄 Download PDF Quotation" if a.status in ["1. Submitted", "2. Under review", "3. Quotation sent"] else "🧾 Download PDF Invoice / Receipt"
                         st.download_button(
                             label=pdf_label, data=pdf_bytes,
@@ -1140,7 +1228,7 @@ else:
                             mime="application/pdf", key=f"pdf_{a.id}"
                         )
                         st.divider()
-                        txns = db.query(ClientPaymentTransaction).filter_by(tenant_id=tid, assignment_id=a.id).all()
+                        txns = db.query(ClientPaymentTransaction).filter_by(tenant_id=a.tenant_id, assignment_id=a.id).all()
                         for tx in txns:
                             tc1, tc2 = st.columns([3, 1])
                             chk_note = f" | CheckoutID: `{tx.checkout_request_id}`" if getattr(tx, "checkout_request_id", "") else ""
@@ -1151,12 +1239,12 @@ else:
                                     a.amount_paid_kes += tx.amount_kes
                                     if a.amount_paid_kes >= a.quoted_cost_kes and a.status in ["1. Submitted", "2. Under review", "3. Quotation sent", "4. Awaiting payment"]:
                                         a.status = "5. Payment confirmed"
-                                    db.add(AssignmentLog(tenant_id=tid, assignment_id=a.id,
+                                    db.add(AssignmentLog(tenant_id=a.tenant_id, assignment_id=a.id,
                                                          actor_name=current_user.full_name,
                                                          action_note=f"Verified M-Pesa {tx.mpesa_code} (KES {tx.amount_kes:,.0f})."))
                                     notify_all_stakeholders(
-                                        db, tid, a,
-                                        f"[{tenant.business_name}] Payment Confirmed: KES {tx.amount_kes:,.0f} ({tx.mpesa_code})",
+                                        db, a.tenant_id, a,
+                                        f"[{proj_tenant.business_name}] Payment Confirmed: KES {tx.amount_kes:,.0f} ({tx.mpesa_code})",
                                         f"M-Pesa payment of KES {tx.amount_kes:,.0f} (Receipt: {tx.mpesa_code}) for '{a.title}' ({a.ref_number}) has been verified.\n"
                                         f"Total Paid: KES {a.amount_paid_kes:,.0f} / KES {a.quoted_cost_kes:,.0f}\n"
                                         f"Current Stage: {a.status}"
@@ -1170,11 +1258,11 @@ else:
                                 stk_phone = st.text_input("M-Pesa Phone (2547XXXXXXXX)", value="254712345678", key=f"stk_ph_{a.id}")
                                 stk_amt = st.number_input("Amount to Pay (KES)", min_value=10.0, value=float(balance), key=f"stk_am_{a.id}")
                                 if st.button("📲 Send M-Pesa STK Push", key=f"stk_btn_{a.id}", type="primary"):
-                                    res = trigger_daraja_stk_push(tenant, stk_phone, int(stk_amt), a.ref_number)
+                                    res = trigger_daraja_stk_push(proj_tenant, stk_phone, int(stk_amt), a.ref_number)
                                     chk_id = res.get("CheckoutRequestID", "")
                                     if chk_id:
                                         db.add(ClientPaymentTransaction(
-                                            tenant_id=tid, assignment_id=a.id,
+                                            tenant_id=a.tenant_id, assignment_id=a.id,
                                             checkout_request_id=chk_id,
                                             amount_kes=float(stk_amt),
                                             mpesa_code=f"STK-{chk_id[-8:]}",
@@ -1182,13 +1270,13 @@ else:
                                             status="Pending Verification"
                                         ))
                                         db.add(AssignmentLog(
-                                            tenant_id=tid, assignment_id=a.id,
+                                            tenant_id=a.tenant_id, assignment_id=a.id,
                                             actor_name=current_user.full_name,
                                             action_note=f"Initiated M-Pesa STK Push ({chk_id}) for KES {stk_amt:,.0f}."
                                         ))
                                         notify_all_stakeholders(
-                                            db, tid, a,
-                                            f"[{tenant.business_name}] M-Pesa STK Push Initiated ({a.ref_number})",
+                                            db, a.tenant_id, a,
+                                            f"[{proj_tenant.business_name}] M-Pesa STK Push Initiated ({a.ref_number})",
                                             f"Client {current_user.full_name} initiated an M-Pesa STK Push of KES {stk_amt:,.0f} from {stk_phone} for '{a.title}' ({a.ref_number}).\nCheckoutRequestID: {chk_id}"
                                         )
                                         db.commit()
@@ -1198,20 +1286,20 @@ else:
                                 m_amt = st.number_input("Paid Amount (KES)", min_value=10.0, value=float(balance), key=f"ma_{a.id}")
                                 if st.button("Submit M-Pesa Code", key=f"sub_mc_{a.id}") and m_code.strip():
                                     clean_code = m_code.strip().upper()
-                                    if db.query(ClientPaymentTransaction).filter_by(tenant_id=tid, mpesa_code=clean_code).first():
+                                    if db.query(ClientPaymentTransaction).filter_by(tenant_id=a.tenant_id, mpesa_code=clean_code).first():
                                         st.error("This M-Pesa confirmation code has already been submitted!")
                                     else:
                                         db.add(ClientPaymentTransaction(
-                                            tenant_id=tid, assignment_id=a.id,
+                                            tenant_id=a.tenant_id, assignment_id=a.id,
                                             amount_kes=m_amt, mpesa_code=clean_code,
                                             phone_number=stk_phone, status="Pending Verification"
                                         ))
-                                        db.add(AssignmentLog(tenant_id=tid, assignment_id=a.id,
+                                        db.add(AssignmentLog(tenant_id=a.tenant_id, assignment_id=a.id,
                                                              actor_name=current_user.full_name,
                                                              action_note=f"Client submitted M-Pesa code {clean_code}."))
                                         notify_all_stakeholders(
-                                            db, tid, a,
-                                            f"[{tenant.business_name}] M-Pesa Receipt Submitted: {clean_code} ({a.ref_number})",
+                                            db, a.tenant_id, a,
+                                            f"[{proj_tenant.business_name}] M-Pesa Receipt Submitted: {clean_code} ({a.ref_number})",
                                             f"Client {current_user.full_name} submitted M-Pesa receipt {clean_code} for KES {m_amt:,.0f} on '{a.title}' ({a.ref_number})."
                                         )
                                         db.commit()
@@ -1219,145 +1307,299 @@ else:
                                         st.rerun()
 
                     with sub_t3:
-                        docs = db.query(AssignmentDocument).filter_by(tenant_id=tid, assignment_id=a.id).all()
-                        for d in docs:
-                            dc1, dc2 = st.columns([3, 1])
-                            dc1.markdown(f"📄 **{d.original_filename}** (`{d.doc_category}`) — _by {d.uploaded_by_name}_")
+                        # Requirement 3: Staff downloads client brief, uploads STAFF_DRAFT to Admin; Admin approves & submits DELIVERABLE to Client
+                        visible_docs = [
+                            d for d in all_proj_docs
+                            if current_user.role in ["TENANT_ADMIN", "STAFF"] or d.doc_category != "STAFF_DRAFT"
+                        ]
+                        if not visible_docs:
+                            st.caption("No files uploaded yet.")
+                        for d in visible_docs:
+                            dc1, dc2, dc3 = st.columns([2.6, 1, 1.4])
+                            cat_label = {
+                                "CLIENT_BRIEF": "📥 Client Brief",
+                                "STAFF_DRAFT": "🔒 Staff Draft (For Admin Review)",
+                                "DELIVERABLE": "✅ Final Client Deliverable"
+                            }.get(d.doc_category, d.doc_category)
+                            dc1.markdown(f"📄 **{d.original_filename}** (`{cat_label}`) — _by {d.uploaded_by_name}_")
                             if os.path.exists(d.file_path):
                                 with open(d.file_path, "rb") as fp:
                                     dc2.download_button("⬇️ Download", data=fp.read(),
                                                         file_name=d.original_filename, key=f"dl_{d.id}")
+                            # Tenant Admin one-click button to promote a Staff Draft into a Client Deliverable
+                            if current_user.role == "TENANT_ADMIN" and d.doc_category == "STAFF_DRAFT":
+                                if dc3.button("🚀 Approve & Send to Client", key=f"prom_{d.id}", type="primary"):
+                                    d.doc_category = "DELIVERABLE"
+                                    a.status = "9. Awaiting client feedback"
+                                    db.add(AssignmentLog(
+                                        tenant_id=a.tenant_id, assignment_id=a.id,
+                                        actor_name=current_user.full_name,
+                                        action_note=f"Approved staff draft '{d.original_filename}' and released as Final Deliverable to client."
+                                    ))
+                                    notify_all_stakeholders(
+                                        db, a.tenant_id, a,
+                                        f"[{proj_tenant.business_name}] Final Deliverable Ready ({a.ref_number}): {d.original_filename}",
+                                        f"Your deliverable '{d.original_filename}' for '{a.title}' ({a.ref_number}) has been reviewed and released by {current_user.full_name}. Please log in to download and review."
+                                    )
+                                    db.commit()
+                                    st.success("Deliverable released to client!")
+                                    st.rerun()
+
                         st.divider()
-                        doc_cat = "DELIVERABLE" if current_user.role in ["TENANT_ADMIN", "STAFF"] else "CLIENT_BRIEF"
-                        new_file = st.file_uploader(f"Upload File ({doc_cat})", key=f"up_{a.id}")
+                        if current_user.role == "STAFF":
+                            doc_cat = "STAFF_DRAFT"
+                            st.info("📤 **Staff Submission:** Upload your completed work below. It goes directly to your **Tenant Admin** for quality review before release to the client.")
+                        elif current_user.role == "TENANT_ADMIN":
+                            doc_cat = st.radio(
+                                "Upload File As:",
+                                ["DELIVERABLE", "STAFF_DRAFT"],
+                                format_func=lambda x: "✅ Final Deliverable (Visible to Client)" if x == "DELIVERABLE" else "🔒 Internal Working Draft (Staff & Admin Only)",
+                                horizontal=True,
+                                key=f"adm_cat_{a.id}"
+                            )
+                        else:
+                            doc_cat = "CLIENT_BRIEF"
+
+                        new_file = st.file_uploader(f"Select File ({doc_cat})", key=f"up_{a.id}")
                         if new_file and st.button("Save Uploaded File", key=f"save_f_{a.id}"):
                             incoming_hash = compute_file_sha256(new_file.getbuffer())
-                            dup = db.query(AssignmentDocument).filter_by(tenant_id=tid, assignment_id=a.id, file_hash=incoming_hash).first()
+                            dup = db.query(AssignmentDocument).filter_by(tenant_id=a.tenant_id, assignment_id=a.id, file_hash=incoming_hash).first()
                             if dup:
                                 st.error(f"Duplicate file blocked: '{dup.original_filename}' already exists on this project.")
                             else:
-                                saved_path, f_hash = save_uploaded_file(tid, a.id, new_file)
+                                saved_path, f_hash = save_uploaded_file(a.tenant_id, a.id, new_file)
                                 db.add(AssignmentDocument(
-                                    tenant_id=tid, assignment_id=a.id,
+                                    tenant_id=a.tenant_id, assignment_id=a.id,
                                     uploaded_by_name=current_user.full_name, doc_category=doc_cat,
                                     original_filename=new_file.name, file_hash=f_hash, file_path=saved_path
                                 ))
-                                db.add(AssignmentLog(tenant_id=tid, assignment_id=a.id,
-                                                     actor_name=current_user.full_name,
-                                                     action_note=f"Uploaded {doc_cat}: {new_file.name}"))
-                                notify_all_stakeholders(
-                                    db, tid, a,
-                                    f"[{tenant.business_name}] New File Uploaded ({a.ref_number}): {new_file.name}",
-                                    f"{current_user.full_name} uploaded '{new_file.name}' ({doc_cat}) to '{a.title}' ({a.ref_number})."
-                                )
+                                if doc_cat == "STAFF_DRAFT":
+                                    a.status = "8. Internal review (Staff -> Admin)"
+                                    db.add(AssignmentLog(tenant_id=a.tenant_id, assignment_id=a.id,
+                                                         actor_name=current_user.full_name,
+                                                         action_note=f"Staff uploaded draft '{new_file.name}' to Admin for review."))
+                                    notify_all_stakeholders(
+                                        db, a.tenant_id, a,
+                                        f"[{proj_tenant.business_name}] Staff Draft Submitted for Admin Review ({a.ref_number})",
+                                        f"Staff {current_user.full_name} uploaded draft '{new_file.name}' on '{a.title}' ({a.ref_number}) for Admin approval.",
+                                        include_client=False
+                                    )
+                                elif doc_cat == "DELIVERABLE":
+                                    if a.status in ["6. Assigned", "7. In progress", "8. Internal review (Staff -> Admin)", "10. Revision requested"]:
+                                        a.status = "9. Awaiting client feedback"
+                                    db.add(AssignmentLog(tenant_id=a.tenant_id, assignment_id=a.id,
+                                                         actor_name=current_user.full_name,
+                                                         action_note=f"Released Final Deliverable to client: {new_file.name}"))
+                                    notify_all_stakeholders(
+                                        db, a.tenant_id, a,
+                                        f"[{proj_tenant.business_name}] Final Deliverable Uploaded ({a.ref_number}): {new_file.name}",
+                                        f"{current_user.full_name} released final deliverable '{new_file.name}' for '{a.title}' ({a.ref_number})."
+                                    )
+                                else:
+                                    db.add(AssignmentLog(tenant_id=a.tenant_id, assignment_id=a.id,
+                                                         actor_name=current_user.full_name,
+                                                         action_note=f"Client uploaded brief: {new_file.name}"))
+                                    notify_all_stakeholders(
+                                        db, a.tenant_id, a,
+                                        f"[{proj_tenant.business_name}] Client File Uploaded ({a.ref_number}): {new_file.name}",
+                                        f"Client {current_user.full_name} uploaded '{new_file.name}' to '{a.title}' ({a.ref_number})."
+                                    )
                                 db.commit()
                                 st.rerun()
 
                     with sub_t4:
-                        msgs = db.query(AssignmentMessage).filter_by(tenant_id=tid, assignment_id=a.id).order_by(AssignmentMessage.sent_at.asc()).all()
-                        for m in msgs:
-                            st.markdown(f"**{m.sender_name}** (`{m.sender_role}`) • _{m.sent_at.strftime('%Y-%m-%d %H:%M')}_  \n> {m.message_text}")
-                        msg_input = st.text_input("Write a message...", key=f"msg_in_{a.id}")
-                        if st.button("Send Message", key=f"msg_btn_{a.id}") and msg_input.strip():
-                            clean_msg = msg_input.strip()
-                            db.add(AssignmentMessage(
-                                tenant_id=tid, assignment_id=a.id,
-                                sender_name=current_user.full_name, sender_role=current_user.role,
-                                message_text=clean_msg
-                            ))
-                            notify_all_stakeholders(
-                                db, tid, a,
-                                f"[{tenant.business_name}] New Message on {a.ref_number} from {current_user.full_name}",
-                                f"{current_user.full_name} ({current_user.role}) posted on '{a.title}' ({a.ref_number}):\n\n\"{clean_msg}\""
-                            )
-                            db.commit()
-                            st.rerun()
+                        # Requirement 3: Separate Client Chat vs Internal Staff <-> Admin Collaboration Channel
+                        all_msgs = db.query(AssignmentMessage).filter_by(tenant_id=a.tenant_id, assignment_id=a.id).order_by(AssignmentMessage.sent_at.asc()).all()
+                        client_msgs = [m for m in all_msgs if getattr(m, "channel", "CLIENT_CHAT") != "INTERNAL_STAFF_ADMIN"]
+                        internal_msgs = [m for m in all_msgs if getattr(m, "channel", "CLIENT_CHAT") == "INTERNAL_STAFF_ADMIN"]
+
+                        if current_user.role in ["TENANT_ADMIN", "STAFF"]:
+                            chat_c1, chat_c2 = st.columns(2)
+                            with chat_c1:
+                                st.markdown("#### 💬 Client & Team Thread")
+                                for m in client_msgs:
+                                    st.markdown(f"**{m.sender_name}** (`{m.sender_role}`) • _{m.sent_at.strftime('%Y-%m-%d %H:%M')}_  \n> {m.message_text}")
+                                pub_input = st.text_input("Message client & team...", key=f"msg_in_{a.id}")
+                                if st.button("Send to Client Thread", key=f"msg_btn_{a.id}") and pub_input.strip():
+                                    clean_msg = pub_input.strip()
+                                    db.add(AssignmentMessage(
+                                        tenant_id=a.tenant_id, assignment_id=a.id,
+                                        sender_name=current_user.full_name, sender_role=current_user.role,
+                                        channel="CLIENT_CHAT", message_text=clean_msg
+                                    ))
+                                    notify_all_stakeholders(
+                                        db, a.tenant_id, a,
+                                        f"[{proj_tenant.business_name}] New Message on {a.ref_number} from {current_user.full_name}",
+                                        f"{current_user.full_name} ({current_user.role}) posted on '{a.title}' ({a.ref_number}):\n\n\"{clean_msg}\""
+                                    )
+                                    db.commit()
+                                    st.rerun()
+
+                            with chat_c2:
+                                st.markdown("#### 🔒 Internal Staff ↔ Admin Chat")
+                                st.caption("Private coordination between Staff & Admin (not visible to Client).")
+                                for m in internal_msgs:
+                                    st.markdown(f"**{m.sender_name}** (`{m.sender_role}`) • _{m.sent_at.strftime('%Y-%m-%d %H:%M')}_  \n> {m.message_text}")
+                                int_input = st.text_input("Private note to Staff / Admin...", key=f"int_msg_in_{a.id}")
+                                if st.button("Send Internal Note", key=f"int_msg_btn_{a.id}", type="primary") and int_input.strip():
+                                    clean_int = int_input.strip()
+                                    db.add(AssignmentMessage(
+                                        tenant_id=a.tenant_id, assignment_id=a.id,
+                                        sender_name=current_user.full_name, sender_role=current_user.role,
+                                        channel="INTERNAL_STAFF_ADMIN", message_text=clean_int
+                                    ))
+                                    notify_all_stakeholders(
+                                        db, a.tenant_id, a,
+                                        f"[{proj_tenant.business_name}] Internal Staff-Admin Note ({a.ref_number})",
+                                        f"{current_user.full_name} ({current_user.role}) posted an internal note on '{a.title}' ({a.ref_number}):\n\n\"{clean_int}\"",
+                                        include_client=False
+                                    )
+                                    db.commit()
+                                    st.rerun()
+                        else:
+                            for m in client_msgs:
+                                st.markdown(f"**{m.sender_name}** (`{m.sender_role}`) • _{m.sent_at.strftime('%Y-%m-%d %H:%M')}_  \n> {m.message_text}")
+                            msg_input = st.text_input("Write a message...", key=f"msg_in_{a.id}")
+                            if st.button("Send Message", key=f"msg_btn_{a.id}") and msg_input.strip():
+                                clean_msg = msg_input.strip()
+                                db.add(AssignmentMessage(
+                                    tenant_id=a.tenant_id, assignment_id=a.id,
+                                    sender_name=current_user.full_name, sender_role=current_user.role,
+                                    channel="CLIENT_CHAT", message_text=clean_msg
+                                ))
+                                notify_all_stakeholders(
+                                    db, a.tenant_id, a,
+                                    f"[{proj_tenant.business_name}] New Message on {a.ref_number} from {current_user.full_name}",
+                                    f"{current_user.full_name} ({current_user.role}) posted on '{a.title}' ({a.ref_number}):\n\n\"{clean_msg}\""
+                                )
+                                db.commit()
+                                st.rerun()
 
                     with sub_t5:
-                        logs = db.query(AssignmentLog).filter_by(tenant_id=tid, assignment_id=a.id).order_by(AssignmentLog.timestamp.desc()).all()
+                        logs = db.query(AssignmentLog).filter_by(tenant_id=a.tenant_id, assignment_id=a.id).order_by(AssignmentLog.timestamp.desc()).all()
                         for lg in logs:
                             st.caption(f"[{lg.timestamp.strftime('%Y-%m-%d %H:%M')}] **{lg.actor_name}**: {lg.action_note}")
 
-    # --- CLIENT TAB 2: DUPLICATE-PROOF SUBMISSION ---
+    # --- CLIENT TAB 2: CHOOSE ANY TENANT, VIEW PUBLIC REVIEWS & TURNAROUND TIME ---
     if current_user.role == "CLIENT":
         with tabs[1]:
-            st.subheader("Submit a New Academic / Research Request")
-            if current_plan and active_tenant_projects_count >= current_plan.max_active_projects:
-                st.warning("This consultancy has reached its current workspace capacity. Please contact the administrator.")
-            elif not services:
-                st.warning("This business has not published any services yet.")
+            st.subheader("Compare Consultancies & Submit a New Request")
+            active_tenants = db.query(Tenant).filter(Tenant.status.in_(["Active", "Trial"])).all()
+            if not active_tenants:
+                st.warning("No active consultancies are available right now.")
             else:
-                with st.form("client_submit_form"):
-                    service_map = {f"{s.title} (From KES {s.base_price_kes:,.0f} • ~{s.turnaround_days} days)": s for s in services}
-                    chosen_srv_label = st.selectbox("Select Service", list(service_map.keys()))
-                    task_title = st.text_input("Project / Assignment Title")
-                    task_desc = st.text_area("Detailed Requirements, Methodology & Expected Deliverables")
-                    pref_deadline = st.date_input("Preferred Deadline", value=utc_now() + timedelta(days=5))
-                    uploaded_doc = st.file_uploader("Attach Supporting Documents (PDF, DOCX, CSV, XLSX, ZIP)")
+                tenant_choices = {}
+                for t_item in active_tenants:
+                    tm = get_tenant_public_metrics(db, t_item.id)
+                    r_badge = f"⭐ {tm['avg_rating']}/5 ({tm['review_count']} reviews)" if tm["review_count"] else "⭐ New (No reviews yet)"
+                    lbl = f"{t_item.business_name} — {r_badge} | ⏱️ Turnaround: {tm['turnaround_label']}"
+                    tenant_choices[lbl] = (t_item, tm)
 
-                    if st.form_submit_button("Submit Request", type="primary"):
-                        clean_title = task_title.strip()
-                        if not clean_title:
-                            st.error("Please enter a project title.")
-                        else:
-                            srv = service_map[chosen_srv_label]
-                            existing_active = db.query(Assignment).filter(
-                                Assignment.tenant_id == tid, Assignment.client_id == current_user.id,
-                                Assignment.status != "11. Closed"
-                            ).all()
-                            if any(ex.title.strip().lower() == clean_title.lower() for ex in existing_active):
-                                st.error(f"Duplicate project blocked: You already have an active project titled '{clean_title}'.")
+                selected_t_lbl = st.selectbox("1. Choose Academic / Research Consultancy for This Project", list(tenant_choices.keys()))
+                chosen_tenant, chosen_metrics = tenant_choices[selected_t_lbl]
+
+                # Public Consultancy Profile, Turnaround Time & Client Reviews Card
+                with st.container(border=True):
+                    p1, p2, p3 = st.columns(3)
+                    p1.metric("Consultancy", chosen_tenant.business_name)
+                    p2.metric(
+                        "Public Client Rating",
+                        f"{chosen_metrics['avg_rating']} / 5.0 ⭐ ({chosen_metrics['review_count']})" if chosen_metrics["review_count"] else "New Workspace"
+                    )
+                    p3.metric("Public Turnaround Time", chosen_metrics["turnaround_label"])
+
+                    if chosen_metrics["reviews"]:
+                        with st.expander(f"📣 Read Public Client Reviews for {chosen_tenant.business_name} ({chosen_metrics['review_count']})", expanded=True):
+                            for rev in sorted(chosen_metrics["reviews"], key=lambda r: r.created_at, reverse=True)[:5]:
+                                st.markdown(f"- {'⭐' * rev.rating} **{rev.client_name}** ({rev.created_at.strftime('%Y-%m-%d')}): _{rev.feedback or 'Great service!'}_")
+                    else:
+                        st.caption("No public client reviews yet for this consultancy — be the first to review after project completion!")
+
+                chosen_plan = db.query(SubscriptionPlan).filter_by(name=chosen_tenant.tier).first()
+                chosen_active_cnt = db.query(Assignment).filter(
+                    Assignment.tenant_id == chosen_tenant.id,
+                    ~Assignment.status.in_(COMPLETED_STATUSES)
+                ).count()
+                chosen_services = db.query(Service).filter_by(tenant_id=chosen_tenant.id).all()
+
+                if chosen_plan and chosen_active_cnt >= chosen_plan.max_active_projects:
+                    st.warning(f"**{chosen_tenant.business_name}** has reached its active project capacity. Please select another consultancy above.")
+                elif not chosen_services:
+                    st.warning(f"**{chosen_tenant.business_name}** has not published any services yet. Please select another consultancy above.")
+                else:
+                    with st.form("client_submit_form"):
+                        service_map = {f"{s.title} (From KES {s.base_price_kes:,.0f} • Public Turnaround: ~{s.turnaround_days} days)": s for s in chosen_services}
+                        chosen_srv_label = st.selectbox("2. Select Service", list(service_map.keys()))
+                        task_title = st.text_input("Project / Assignment Title")
+                        task_desc = st.text_area("Detailed Requirements, Methodology & Expected Deliverables")
+                        pref_deadline = st.date_input("Preferred Deadline", value=utc_now() + timedelta(days=5))
+                        uploaded_doc = st.file_uploader("Attach Supporting Documents (PDF, DOCX, CSV, XLSX, ZIP)")
+
+                        if st.form_submit_button(f"Submit Request to {chosen_tenant.business_name}", type="primary"):
+                            clean_title = task_title.strip()
+                            if not clean_title:
+                                st.error("Please enter a project title.")
                             else:
-                                rand_num = random.randint(1000, 9999)
-                                ref_no = f"AF-{utc_now().year}-{rand_num}"
-                                inv_no = f"INV-{utc_now().year}-{rand_num}"
-                                new_a = Assignment(
-                                    tenant_id=tid, ref_number=ref_no, invoice_number=inv_no,
-                                    title=clean_title, description=task_desc,
-                                    service_id=srv.id, client_id=current_user.id,
-                                    status=ASSIGNMENT_STATUSES[0], quoted_cost_kes=srv.base_price_kes,
-                                    deadline=datetime.combine(pref_deadline, datetime.min.time())
-                                )
-                                db.add(new_a)
-                                db.commit()
+                                srv = service_map[chosen_srv_label]
+                                existing_active = db.query(Assignment).filter(
+                                    Assignment.tenant_id == chosen_tenant.id,
+                                    Assignment.client_id == current_user.id,
+                                    ~Assignment.status.in_(["11. Closed", "12. Closed"])
+                                ).all()
+                                if any(ex.title.strip().lower() == clean_title.lower() for ex in existing_active):
+                                    st.error(f"Duplicate project blocked: You already have an active project titled '{clean_title}' with {chosen_tenant.business_name}.")
+                                else:
+                                    rand_num = random.randint(1000, 9999)
+                                    ref_no = f"AF-{utc_now().year}-{rand_num}"
+                                    inv_no = f"INV-{utc_now().year}-{rand_num}"
+                                    new_a = Assignment(
+                                        tenant_id=chosen_tenant.id, ref_number=ref_no, invoice_number=inv_no,
+                                        title=clean_title, description=task_desc,
+                                        service_id=srv.id, client_id=current_user.id,
+                                        status=ASSIGNMENT_STATUSES[0], quoted_cost_kes=srv.base_price_kes,
+                                        deadline=datetime.combine(pref_deadline, datetime.min.time())
+                                    )
+                                    db.add(new_a)
+                                    db.commit()
 
-                                if uploaded_doc:
-                                    saved_path, f_hash = save_uploaded_file(tid, new_a.id, uploaded_doc)
-                                    db.add(AssignmentDocument(
-                                        tenant_id=tid, assignment_id=new_a.id,
-                                        uploaded_by_name=current_user.full_name, doc_category="CLIENT_BRIEF",
-                                        original_filename=uploaded_doc.name, file_hash=f_hash, file_path=saved_path
-                                    ))
+                                    if uploaded_doc:
+                                        saved_path, f_hash = save_uploaded_file(chosen_tenant.id, new_a.id, uploaded_doc)
+                                        db.add(AssignmentDocument(
+                                            tenant_id=chosen_tenant.id, assignment_id=new_a.id,
+                                            uploaded_by_name=current_user.full_name, doc_category="CLIENT_BRIEF",
+                                            original_filename=uploaded_doc.name, file_hash=f_hash, file_path=saved_path
+                                        ))
 
-                                db.add(AssignmentLog(tenant_id=tid, assignment_id=new_a.id,
-                                                     actor_name=current_user.full_name,
-                                                     action_note=f"Submitted request {ref_no} ({inv_no})."))
-                                notify_all_stakeholders(
-                                    db, tid, new_a,
-                                    f"[{tenant.business_name}] New Work Posted ({ref_no}): {clean_title}",
-                                    f"New assignment posted on {tenant.business_name}!\n"
-                                    f"Reference: {ref_no} | Invoice: {inv_no}\n"
-                                    f"Client: {current_user.full_name} ({current_user.email})\n"
-                                    f"Service: {srv.title} | Quoted: KES {srv.base_price_kes:,.0f}\n"
-                                    f"Deadline: {pref_deadline}\n"
-                                    f"Requirements: {task_desc}"
-                                )
-                                db.commit()
-                                st.success(f"Request submitted and all stakeholders notified! Reference: **{ref_no}** | Invoice: **{inv_no}**")
-                                st.rerun()
+                                    db.add(AssignmentLog(tenant_id=chosen_tenant.id, assignment_id=new_a.id,
+                                                         actor_name=current_user.full_name,
+                                                         action_note=f"Submitted request {ref_no} ({inv_no}) to {chosen_tenant.business_name}."))
+                                    notify_all_stakeholders(
+                                        db, chosen_tenant.id, new_a,
+                                        f"[{chosen_tenant.business_name}] New Work Posted ({ref_no}): {clean_title}",
+                                        f"New assignment posted on {chosen_tenant.business_name}!\n"
+                                        f"Reference: {ref_no} | Invoice: {inv_no}\n"
+                                        f"Client: {current_user.full_name} ({current_user.email})\n"
+                                        f"Service: {srv.title} | Quoted: KES {srv.base_price_kes:,.0f}\n"
+                                        f"Deadline: {pref_deadline}\n"
+                                        f"Requirements: {task_desc}"
+                                    )
+                                    db.commit()
+                                    st.success(f"Request submitted to **{chosen_tenant.business_name}**! Reference: **{ref_no}** | Invoice: **{inv_no}**")
+                                    st.rerun()
 
     # --- TENANT ADMIN EXTRA TABS ---
     if current_user.role == "TENANT_ADMIN":
         with tabs[1]:
-            st.subheader("Workspace Performance & Client Satisfaction")
-            reviews = db.query(ClientReview).filter_by(tenant_id=tid).all()
-            avg_rating = (sum(r.rating for r in reviews) / len(reviews)) if reviews else 0.0
-            total_clients = db.query(User).filter_by(tenant_id=tid, role="CLIENT").count()
+            st.subheader("Workspace Performance, Turnaround & Client Satisfaction")
+            t_pub = get_tenant_public_metrics(db, tid)
+            reviews = t_pub["reviews"]
+            total_clients = db.query(Assignment.client_id).filter_by(tenant_id=tid).distinct().count()
 
-            ac1, ac2, ac3 = st.columns(3)
-            ac1.metric("Total Registered Clients", total_clients)
-            ac2.metric("Completed Projects", sum(1 for a in assignments if a.status in ["10. Completed", "11. Closed"]))
-            ac3.metric("Client Satisfaction", f"{avg_rating:.1f} / 5.0 ⭐" if reviews else "No reviews yet")
+            ac1, ac2, ac3, ac4 = st.columns(4)
+            ac1.metric("Active / Past Clients", total_clients)
+            ac2.metric("Completed Projects", sum(1 for a in assignments if a.status in COMPLETED_STATUSES))
+            ac3.metric("Public Client Rating", f"{t_pub['avg_rating']:.1f} / 5.0 ⭐ ({t_pub['review_count']})" if reviews else "No reviews yet")
+            ac4.metric("Public Turnaround Time", t_pub["turnaround_label"])
 
             if assignments:
                 st.markdown("**Assignments by Workflow Stage**")
@@ -1365,21 +1607,21 @@ else:
                 st.bar_chart(stage_counts)
 
             if reviews:
-                st.markdown("**Recent Client Feedback**")
+                st.markdown("**Public Client Reviews**")
                 for r in reviews:
-                    st.write(f"• {'⭐' * r.rating} **{r.client_name}**: _{r.feedback}_")
+                    st.write(f"• {'⭐' * r.rating} **{r.client_name}** ({r.created_at.strftime('%Y-%m-%d')}): _{r.feedback}_")
 
         with tabs[2]:
-            st.subheader("Business Service Catalogue")
+            st.subheader("Business Service Catalogue (Public Turnaround & Pricing)")
             for s in services:
-                st.markdown(f"- **{s.title}** — KES {s.base_price_kes:,.0f} ({s.turnaround_days} days)  \n  _{s.description}_")
+                st.markdown(f"- **{s.title}** — KES {s.base_price_kes:,.0f} (Public Turnaround: **{s.turnaround_days} days**)  \n  _{s.description}_")
             st.divider()
             with st.form("add_service_form"):
                 st.markdown("**Add New Service**")
                 s_title = st.text_input("Service Name")
                 s_desc = st.text_input("Description")
                 s_price = st.number_input("Base Price (KES)", min_value=500.0, step=500.0)
-                s_days = st.number_input("Turnaround (Days)", min_value=1, value=3)
+                s_days = st.number_input("Public Turnaround (Days)", min_value=1, value=3)
                 if st.form_submit_button("Add Service") and s_title:
                     if any(existing.title.strip().lower() == s_title.strip().lower() for existing in services):
                         st.error("A service with this name already exists.")
@@ -1424,7 +1666,7 @@ else:
             t_users = db.query(User).filter_by(tenant_id=tid).all()
             st.dataframe(pd.DataFrame([{"Name": u.full_name, "Email": u.email, "Role": u.role} for u in t_users]), use_container_width=True)
 
-            col_staff, col_saas, col_sup = st.columns([1, 1.3, 1])
+            col_staff, col_saas, col_sup = st.columns([1, 1.3, 1.1])
             with col_staff:
                 with st.form("invite_staff_form"):
                     st.markdown("**Add Staff / Researcher**")
@@ -1454,7 +1696,7 @@ else:
                             st.rerun()
 
             with col_saas:
-                render_subscription_stk_box()
+                render_subscription_stk_box(tenant)
 
             with col_sup:
                 with st.form("support_ticket_form"):
@@ -1474,5 +1716,17 @@ else:
                         db.commit()
                         st.success("Support ticket sent to Super Admin!")
                         st.rerun()
+
+                # Requirement 2: Tenant view of their support tickets & Super Admin responses
+                my_tickets = db.query(SupportTicket).filter_by(tenant_id=tid).order_by(SupportTicket.created_at.desc()).all()
+                if my_tickets:
+                    st.markdown("**My Support Tickets & Super Admin Replies:**")
+                    for mtk in my_tickets:
+                        with st.expander(f"[{mtk.status}] {mtk.subject} ({mtk.created_at.strftime('%Y-%m-%d')})", expanded=(mtk.status == "Resolved")):
+                            st.write(f"**Issue:** {mtk.description}")
+                            if mtk.admin_reply:
+                                st.success(f"**Super Admin Response:** {mtk.admin_reply}")
+                            else:
+                                st.info("⏳ Awaiting response from Super Admin.")
 
 db.close()
