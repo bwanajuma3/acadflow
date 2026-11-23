@@ -11,7 +11,7 @@ import random
 from fpdf import FPDF
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, Boolean,
-    DateTime, ForeignKey, Text
+    DateTime, ForeignKey, Text, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -195,6 +195,7 @@ class ClientPaymentTransaction(Base):
     id = Column(Integer, primary_key=True, index=True)
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
     assignment_id = Column(Integer, ForeignKey("assignments.id"), nullable=False)
+    checkout_request_id = Column(String, default="")
     amount_kes = Column(Float, nullable=False)
     mpesa_code = Column(String, nullable=False)
     phone_number = Column(String, default="")
@@ -242,35 +243,84 @@ class EmailNotificationLog(Base):
     sent_at = Column(DateTime, default=utc_now)
 
 Base.metadata.create_all(bind=engine)
+try:
+    with engine.begin() as conn:
+        if DATABASE_URL.startswith("sqlite"):
+            cols = [row[1] for row in conn.execute(text("PRAGMA table_info(client_payments)")).fetchall()]
+            if "checkout_request_id" not in cols:
+                conn.execute(text("ALTER TABLE client_payments ADD COLUMN checkout_request_id VARCHAR"))
+        else:
+            conn.execute(text("ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS checkout_request_id VARCHAR;"))
+except Exception:
+    pass
 
 # ==========================================
 # 3. EMAIL, PDF & DARAJA SERVICES
 # ==========================================
 def dispatch_email_notification(db, tenant_id: int | None, recipient: str, subject: str, body: str):
-    """Sends real SMTP email if SMTP_HOST is configured in env/secrets; always records an auditable log."""
+    """Sends real SMTP email (supports port 587 STARTTLS and port 465 SSL) and records an auditable log."""
     smtp_host = get_secret("SMTP_HOST")
+    smtp_port = int(get_secret("SMTP_PORT", "587"))
     smtp_user = get_secret("SMTP_USER")
-    smtp_pass = get_secret("SMTP_PASS")
-    status = "Logged (Configure SMTP_HOST secret for live email)"
+    smtp_pass = get_secret("SMTP_PASSWORD") or get_secret("SMTP_PASS")
+    status = "Logged (Configure SMTP_HOST, SMTP_USER & SMTP_PASSWORD secrets for live email)"
 
-    if smtp_host and smtp_user and smtp_pass:
+    if smtp_host and smtp_user and smtp_pass and recipient and "@" in recipient:
         try:
             msg = EmailMessage()
             msg["Subject"] = subject
-            msg["From"] = smtp_user
-            msg["To"] = recipient
+            msg["From"] = f"AcadFlow <{smtp_user}>"
+            msg["To"] = recipient.strip()
             msg.set_content(body)
-            with smtplib.SMTP_SSL(smtp_host, 465, timeout=10) as server:
-                server.login(smtp_user, smtp_pass)
-                server.send_message(msg)
+            if smtp_port == 465:
+                with smtplib.SMTP_SSL(smtp_host, 465, timeout=12) as server:
+                    server.login(smtp_user, smtp_pass)
+                    server.send_message(msg)
+            else:
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=12) as server:
+                    server.starttls()
+                    server.login(smtp_user, smtp_pass)
+                    server.send_message(msg)
             status = "Sent via SMTP"
         except Exception as exc:
             status = f"SMTP Error: {exc}"
 
     db.add(EmailNotificationLog(
-        tenant_id=tenant_id, recipient_email=recipient,
+        tenant_id=tenant_id, recipient_email=recipient.strip(),
         subject=subject, body=body, delivery_status=status
     ))
+
+def notify_all_stakeholders(db, tenant_id: int | None, assignment: Assignment | None, subject: str, body: str):
+    """Broadcasts notifications to Client, Assigned Staff, Tenant Admins, and Super Admin."""
+    recipients = set()
+
+    # 1. Super Admin email from secrets + database SUPER_ADMIN accounts
+    configured_super = get_secret("SUPER_ADMIN_EMAIL")
+    if configured_super and "@" in configured_super:
+        recipients.add(configured_super.strip().lower())
+    for sa in db.query(User).filter_by(role="SUPER_ADMIN").all():
+        if sa.email and "@" in sa.email:
+            recipients.add(sa.email.strip().lower())
+
+    # 2. All Tenant Admins for the workspace
+    if tenant_id:
+        for admin in db.query(User).filter_by(tenant_id=tenant_id, role="TENANT_ADMIN").all():
+            if admin.email and "@" in admin.email:
+                recipients.add(admin.email.strip().lower())
+
+    # 3. Client & Assigned Staff on the specific assignment
+    if assignment is not None:
+        if assignment.client_id:
+            client_u = db.query(User).filter_by(id=assignment.client_id).first()
+            if client_u and client_u.email:
+                recipients.add(client_u.email.strip().lower())
+        if assignment.staff_id:
+            staff_u = db.query(User).filter_by(id=assignment.staff_id).first()
+            if staff_u and staff_u.email:
+                recipients.add(staff_u.email.strip().lower())
+
+    for email_addr in sorted(recipients):
+        dispatch_email_notification(db, tenant_id, email_addr, subject, body)
 
 def generate_financial_pdf(tenant: Tenant, assignment: Assignment, client: User, service_title: str) -> bytes:
     is_quote = assignment.status in ["1. Submitted", "2. Under review", "3. Quotation sent"]
@@ -347,30 +397,41 @@ def generate_financial_pdf(tenant: Tenant, assignment: Assignment, client: User,
     return bytes(pdf.output())
 
 def trigger_daraja_stk_push(tenant: Tenant, phone: str, amount: int, account_ref: str) -> dict:
-    if not (tenant.daraja_consumer_key and tenant.daraja_consumer_secret and tenant.daraja_passkey):
+    clean_phone = phone.strip().replace("+", "")
+    if clean_phone.startswith("0") and len(clean_phone) == 10:
+        clean_phone = "254" + clean_phone[1:]
+
+    c_key = (tenant.daraja_consumer_key or "").strip() or get_secret("DARAJA_CONSUMER_KEY")
+    c_sec = (tenant.daraja_consumer_secret or "").strip() or get_secret("DARAJA_CONSUMER_SECRET")
+    passkey = (tenant.daraja_passkey or "").strip() or get_secret("DARAJA_PASSKEY")
+    shortcode = get_secret("DARAJA_SHORTCODE") or tenant.mpesa_paybill
+    daraja_env = get_secret("DARAJA_ENV", "sandbox").strip().lower()
+
+    if not (c_key and c_sec and passkey) or c_key.startswith("YOUR_"):
         sim_id = f"ws_CO_{utc_now().strftime('%d%m%Y%H%M%S')}_{random.randint(1000,9999)}"
         return {
             "mode": "SANDBOX_SIMULATION",
             "CheckoutRequestID": sim_id,
-            "CustomerMessage": f"Simulated STK Push sent to {phone} for KES {amount:,.0f} (Paybill {tenant.mpesa_paybill})."
+            "CustomerMessage": f"Simulated STK Push sent to {clean_phone} for KES {amount:,.0f} (CheckoutRequestID: {sim_id})."
         }
     try:
-        auth_url = "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
-        auth_res = requests.get(auth_url, auth=(tenant.daraja_consumer_key, tenant.daraja_consumer_secret), timeout=10)
+        base_api = "https://api.safaricom.co.ke" if daraja_env == "production" else "https://sandbox.safaricom.co.ke"
+        auth_url = f"{base_api}/oauth/v1/generate?grant_type=client_credentials"
+        auth_res = requests.get(auth_url, auth=(c_key, c_sec), timeout=10)
         access_token = auth_res.json().get("access_token")
         timestamp = utc_now().strftime("%Y%m%d%H%M%S")
-        password = base64.b64encode(f"{tenant.mpesa_paybill}{tenant.daraja_passkey}{timestamp}".encode()).decode()
-        stk_url = "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
-        callback_url = get_secret("DARAJA_CALLBACK_URL", "https://acadflow.co.ke/api/mpesa/callback")
+        password = base64.b64encode(f"{shortcode}{passkey}{timestamp}".encode()).decode()
+        stk_url = f"{base_api}/mpesa/stkpush/v1/processrequest"
+        callback_url = get_secret("DARAJA_CALLBACK_URL", "https://acadflow-webhook.onrender.com/api/mpesa/callback")
         payload = {
-            "BusinessShortCode": tenant.mpesa_paybill,
+            "BusinessShortCode": shortcode,
             "Password": password,
             "Timestamp": timestamp,
             "TransactionType": "CustomerPayBillOnline",
             "Amount": int(amount),
-            "PartyA": phone,
-            "PartyB": tenant.mpesa_paybill,
-            "PhoneNumber": phone,
+            "PartyA": clean_phone,
+            "PartyB": shortcode,
+            "PhoneNumber": clean_phone,
             "CallBackURL": callback_url,
             "AccountReference": account_ref[:12],
             "TransactionDesc": "AcadFlow Payment"
@@ -404,15 +465,14 @@ def seed_database():
         db.close()
         return
 
-    # Always ensure a Super Admin account exists on fresh databases
+    super_admin_email = get_secret("SUPER_ADMIN_EMAIL", "super@acadflow.co.ke").strip()
     super_admin = User(
-        tenant_id=None, full_name="Platform Owner", email="super@acadflow.co.ke",
+        tenant_id=None, full_name="Platform Owner", email=super_admin_email,
         password_hash=hash_password("admin123"), role="SUPER_ADMIN"
     )
     db.add(super_admin)
     db.commit()
 
-    # Only seed sample demo workspaces if DEMO_MODE is explicitly enabled
     if not DEMO_MODE:
         db.close()
         return
@@ -554,14 +614,26 @@ if not current_user:
                             if db.query(User).filter_by(email=c_email.strip()).first():
                                 st.error("An account with this email already exists.")
                             else:
+                                selected_tid = t_map[chosen_biz]
                                 new_client = User(
-                                    tenant_id=t_map[chosen_biz],
+                                    tenant_id=selected_tid,
                                     full_name=c_name.strip(),
                                     email=c_email.strip(),
                                     password_hash=hash_password(c_pass),
                                     role="CLIENT"
                                 )
                                 db.add(new_client)
+                                db.commit()
+                                notify_all_stakeholders(
+                                    db, selected_tid, None,
+                                    f"[AcadFlow] New Client Registered: {new_client.full_name} ({chosen_biz})",
+                                    f"Client {new_client.full_name} ({new_client.email}) joined {chosen_biz}."
+                                )
+                                dispatch_email_notification(
+                                    db, selected_tid, new_client.email,
+                                    f"Welcome to {chosen_biz} on AcadFlow",
+                                    f"Hello {new_client.full_name}, your client account for {chosen_biz} is active."
+                                )
                                 db.commit()
                                 st.session_state.user_id = new_client.id
                                 st.rerun()
@@ -593,6 +665,12 @@ if not current_user:
                                 role="TENANT_ADMIN"
                             )
                             db.add(new_admin)
+                            db.commit()
+                            notify_all_stakeholders(
+                                db, new_tenant.id, None,
+                                f"[AcadFlow] New Business Registered: {new_tenant.business_name} ({biz_tier})",
+                                f"Workspace '{new_tenant.business_name}' was created by {new_admin.full_name} ({new_admin.email}) on the {biz_tier} tier."
+                            )
                             db.commit()
                             st.session_state.user_id = new_admin.id
                             st.rerun()
@@ -698,10 +776,14 @@ if current_user.role == "SUPER_ADMIN":
                 if new_status != t.status or new_tier != t.tier:
                     t.status = new_status
                     t.tier = new_tier
+                    notify_all_stakeholders(
+                        db, t.id, None,
+                        f"[AcadFlow] Workspace Updated: {t.business_name} ({new_tier} - {new_status})",
+                        f"Workspace '{t.business_name}' subscription tier is now {new_tier} and status is {new_status}."
+                    )
                     db.commit()
                     st.rerun()
 
-                # User password reset / governance for this workspace
                 t_users = db.query(User).filter_by(tenant_id=t.id).all()
                 if t_users:
                     u_col1, u_col2, u_col3 = st.columns([2, 1.5, 1])
@@ -766,12 +848,17 @@ if current_user.role == "SUPER_ADMIN":
                     if st.button("Mark Resolved & Reply", key=f"tk_btn_{tk.id}"):
                         tk.admin_reply = rep
                         tk.status = "Resolved"
+                        notify_all_stakeholders(
+                            db, tk.tenant_id, None,
+                            f"[AcadFlow Support] Ticket Resolved: {tk.subject}",
+                            f"Your support ticket '{tk.subject}' has been resolved.\n\nReply: {rep}"
+                        )
                         db.commit()
                         st.rerun()
 
     with sa_tabs[4]:
         st.subheader("System Email Notification Audit Log")
-        logs = db.query(EmailNotificationLog).order_by(EmailNotificationLog.sent_at.desc()).limit(50).all()
+        logs = db.query(EmailNotificationLog).order_by(EmailNotificationLog.sent_at.desc()).limit(100).all()
         st.dataframe(pd.DataFrame([{
             "To": l.recipient_email, "Subject": l.subject, "Status": l.delivery_status,
             "Sent At": l.sent_at.strftime("%Y-%m-%d %H:%M")
@@ -879,15 +966,10 @@ else:
                                 if st.button("Save Project Changes", key=f"upd_{a.id}", type="primary"):
                                     changes = []
                                     if new_st != a.status:
-                                        changes.append(f"Status: '{a.status}' → '{new_st}'")
+                                        changes.append(f"Status: '{a.status}' -> '{new_st}'")
                                         a.status = new_st
                                         if new_st == "10. Completed":
                                             a.completed_at = utc_now()
-                                        dispatch_email_notification(
-                                            db, tid, client_obj.email,
-                                            f"[{a.ref_number}] Status Updated to {new_st}",
-                                            f"Hello {client_obj.full_name}, your project '{a.title}' is now at stage: {new_st}."
-                                        )
                                     if current_user.role == "TENANT_ADMIN":
                                         chosen = next((s for s in staff_members if s.full_name == sel_staff), None)
                                         new_sid = chosen.id if chosen else None
@@ -896,21 +978,24 @@ else:
                                             a.staff_id = new_sid
                                             if a.status in ["1. Submitted", "5. Payment confirmed"] and new_sid is not None:
                                                 a.status = "6. Assigned"
-                                            if chosen:
-                                                dispatch_email_notification(
-                                                    db, tid, chosen.email,
-                                                    f"[{a.ref_number}] New Project Assigned to You",
-                                                    f"Hello {chosen.full_name}, you have been assigned '{a.title}' (Due {a.deadline.strftime('%Y-%m-%d')})."
-                                                )
                                         if new_q != a.quoted_cost_kes:
                                             changes.append(f"Quote updated to KES {new_q:,.0f}")
                                             a.quoted_cost_kes = new_q
 
                                     if changes:
+                                        summary_note = "; ".join(changes)
                                         db.add(AssignmentLog(tenant_id=tid, assignment_id=a.id,
-                                                             actor_name=current_user.full_name, action_note="; ".join(changes)))
+                                                             actor_name=current_user.full_name, action_note=summary_note))
+                                        notify_all_stakeholders(
+                                            db, tid, a,
+                                            f"[{tenant.business_name}] Progress Update ({a.ref_number}): {a.status}",
+                                            f"Project: {a.title} ({a.ref_number})\n"
+                                            f"Updated by: {current_user.full_name}\n"
+                                            f"Changes: {summary_note}\n"
+                                            f"Current Stage: {a.status} | Quoted: KES {a.quoted_cost_kes:,.0f} | Paid: KES {a.amount_paid_kes:,.0f}"
+                                        )
                                         db.commit()
-                                        st.success("Project updated!")
+                                        st.success("Project updated and all stakeholders notified!")
                                         st.rerun()
                                     else:
                                         st.info("No new changes detected.")
@@ -922,12 +1007,22 @@ else:
                                         a.completed_at = utc_now()
                                         db.add(AssignmentLog(tenant_id=tid, assignment_id=a.id,
                                                              actor_name=current_user.full_name, action_note="Client approved final work."))
+                                        notify_all_stakeholders(
+                                            db, tid, a,
+                                            f"[{tenant.business_name}] Work Approved ({a.ref_number}): 10. Completed",
+                                            f"Client {current_user.full_name} approved final deliverables for '{a.title}' ({a.ref_number})."
+                                        )
                                         db.commit()
                                         st.rerun()
                                     if c_b2.button("🔄 Request Revision", key=f"rev_{a.id}"):
                                         a.status = "9. Revision requested"
                                         db.add(AssignmentLog(tenant_id=tid, assignment_id=a.id,
                                                              actor_name=current_user.full_name, action_note="Client requested revision."))
+                                        notify_all_stakeholders(
+                                            db, tid, a,
+                                            f"[{tenant.business_name}] Revision Requested ({a.ref_number})",
+                                            f"Client {current_user.full_name} requested a revision on '{a.title}' ({a.ref_number})."
+                                        )
                                         db.commit()
                                         st.rerun()
 
@@ -941,6 +1036,11 @@ else:
                                                 tenant_id=tid, assignment_id=a.id,
                                                 client_name=current_user.full_name, rating=stars, feedback=fb_text
                                             ))
+                                            notify_all_stakeholders(
+                                                db, tid, a,
+                                                f"[{tenant.business_name}] New Client Review ({stars}/5) - {a.ref_number}",
+                                                f"{current_user.full_name} rated '{a.title}' {stars}/5 stars: {fb_text}"
+                                            )
                                             db.commit()
                                             st.rerun()
 
@@ -956,20 +1056,23 @@ else:
                         txns = db.query(ClientPaymentTransaction).filter_by(tenant_id=tid, assignment_id=a.id).all()
                         for tx in txns:
                             tc1, tc2 = st.columns([3, 1])
-                            tc1.write(f"• M-Pesa Code: **`{tx.mpesa_code}`** | KES `{tx.amount_kes:,.0f}` | Status: `{tx.status}`")
+                            chk_note = f" | CheckoutID: `{tx.checkout_request_id}`" if getattr(tx, "checkout_request_id", "") else ""
+                            tc1.write(f"• M-Pesa Code: **`{tx.mpesa_code}`** | KES `{tx.amount_kes:,.0f}` | Status: `{tx.status}`{chk_note}")
                             if current_user.role == "TENANT_ADMIN" and tx.status == "Pending Verification":
                                 if tc2.button("✅ Verify Payment", key=f"ver_{tx.id}"):
                                     tx.status = "Verified"
                                     a.amount_paid_kes += tx.amount_kes
-                                    if a.amount_paid_kes >= a.quoted_cost_kes and a.status in ["3. Quotation sent", "4. Awaiting payment"]:
+                                    if a.amount_paid_kes >= a.quoted_cost_kes and a.status in ["1. Submitted", "2. Under review", "3. Quotation sent", "4. Awaiting payment"]:
                                         a.status = "5. Payment confirmed"
                                     db.add(AssignmentLog(tenant_id=tid, assignment_id=a.id,
                                                          actor_name=current_user.full_name,
                                                          action_note=f"Verified M-Pesa {tx.mpesa_code} (KES {tx.amount_kes:,.0f})."))
-                                    dispatch_email_notification(
-                                        db, tid, client_obj.email,
-                                        f"[{a.ref_number}] Payment Confirmed (KES {tx.amount_kes:,.0f})",
-                                        f"Thank you {client_obj.full_name}, M-Pesa receipt {tx.mpesa_code} has been verified."
+                                    notify_all_stakeholders(
+                                        db, tid, a,
+                                        f"[{tenant.business_name}] Payment Confirmed: KES {tx.amount_kes:,.0f} ({tx.mpesa_code})",
+                                        f"M-Pesa payment of KES {tx.amount_kes:,.0f} (Receipt: {tx.mpesa_code}) for '{a.title}' ({a.ref_number}) has been verified.\n"
+                                        f"Total Paid: KES {a.amount_paid_kes:,.0f} / KES {a.quoted_cost_kes:,.0f}\n"
+                                        f"Current Stage: {a.status}"
                                     )
                                     db.commit()
                                     st.rerun()
@@ -981,24 +1084,51 @@ else:
                                 stk_amt = st.number_input("Amount to Pay (KES)", min_value=10.0, value=float(balance), key=f"stk_am_{a.id}")
                                 if st.button("📲 Send M-Pesa STK Push", key=f"stk_btn_{a.id}", type="primary"):
                                     res = trigger_daraja_stk_push(tenant, stk_phone, int(stk_amt), a.ref_number)
-                                    st.info(res.get("CustomerMessage"))
+                                    chk_id = res.get("CheckoutRequestID", "")
+                                    if chk_id:
+                                        db.add(ClientPaymentTransaction(
+                                            tenant_id=tid, assignment_id=a.id,
+                                            checkout_request_id=chk_id,
+                                            amount_kes=float(stk_amt),
+                                            mpesa_code=f"STK-{chk_id[-8:]}",
+                                            phone_number=stk_phone.strip(),
+                                            status="Pending Verification"
+                                        ))
+                                        db.add(AssignmentLog(
+                                            tenant_id=tid, assignment_id=a.id,
+                                            actor_name=current_user.full_name,
+                                            action_note=f"Initiated M-Pesa STK Push ({chk_id}) for KES {stk_amt:,.0f}."
+                                        ))
+                                        notify_all_stakeholders(
+                                            db, tid, a,
+                                            f"[{tenant.business_name}] M-Pesa STK Push Initiated ({a.ref_number})",
+                                            f"Client {current_user.full_name} initiated an M-Pesa STK Push of KES {stk_amt:,.0f} from {stk_phone} for '{a.title}' ({a.ref_number}).\nCheckoutRequestID: {chk_id}"
+                                        )
+                                        db.commit()
+                                    st.info(res.get("CustomerMessage", "STK Push request processed."))
                             with p_col2:
                                 m_code = st.text_input("Or Enter M-Pesa Confirmation Code", placeholder="e.g. SL84K92P10", key=f"mc_{a.id}")
                                 m_amt = st.number_input("Paid Amount (KES)", min_value=10.0, value=float(balance), key=f"ma_{a.id}")
                                 if st.button("Submit M-Pesa Code", key=f"sub_mc_{a.id}") and m_code.strip():
-                                    if db.query(ClientPaymentTransaction).filter_by(tenant_id=tid, mpesa_code=m_code.strip().upper()).first():
+                                    clean_code = m_code.strip().upper()
+                                    if db.query(ClientPaymentTransaction).filter_by(tenant_id=tid, mpesa_code=clean_code).first():
                                         st.error("This M-Pesa confirmation code has already been submitted!")
                                     else:
                                         db.add(ClientPaymentTransaction(
                                             tenant_id=tid, assignment_id=a.id,
-                                            amount_kes=m_amt, mpesa_code=m_code.strip().upper(),
+                                            amount_kes=m_amt, mpesa_code=clean_code,
                                             phone_number=stk_phone, status="Pending Verification"
                                         ))
                                         db.add(AssignmentLog(tenant_id=tid, assignment_id=a.id,
                                                              actor_name=current_user.full_name,
-                                                             action_note=f"Client submitted M-Pesa code {m_code.strip().upper()}."))
+                                                             action_note=f"Client submitted M-Pesa code {clean_code}."))
+                                        notify_all_stakeholders(
+                                            db, tid, a,
+                                            f"[{tenant.business_name}] M-Pesa Receipt Submitted: {clean_code} ({a.ref_number})",
+                                            f"Client {current_user.full_name} submitted M-Pesa receipt {clean_code} for KES {m_amt:,.0f} on '{a.title}' ({a.ref_number})."
+                                        )
                                         db.commit()
-                                        st.success("Payment submitted for Admin verification!")
+                                        st.success("Payment submitted and all stakeholders notified!")
                                         st.rerun()
 
                     with sub_t3:
@@ -1028,6 +1158,11 @@ else:
                                 db.add(AssignmentLog(tenant_id=tid, assignment_id=a.id,
                                                      actor_name=current_user.full_name,
                                                      action_note=f"Uploaded {doc_cat}: {new_file.name}"))
+                                notify_all_stakeholders(
+                                    db, tid, a,
+                                    f"[{tenant.business_name}] New File Uploaded ({a.ref_number}): {new_file.name}",
+                                    f"{current_user.full_name} uploaded '{new_file.name}' ({doc_cat}) to '{a.title}' ({a.ref_number})."
+                                )
                                 db.commit()
                                 st.rerun()
 
@@ -1037,11 +1172,17 @@ else:
                             st.markdown(f"**{m.sender_name}** (`{m.sender_role}`) • _{m.sent_at.strftime('%Y-%m-%d %H:%M')}_  \n> {m.message_text}")
                         msg_input = st.text_input("Write a message...", key=f"msg_in_{a.id}")
                         if st.button("Send Message", key=f"msg_btn_{a.id}") and msg_input.strip():
+                            clean_msg = msg_input.strip()
                             db.add(AssignmentMessage(
                                 tenant_id=tid, assignment_id=a.id,
                                 sender_name=current_user.full_name, sender_role=current_user.role,
-                                message_text=msg_input.strip()
+                                message_text=clean_msg
                             ))
+                            notify_all_stakeholders(
+                                db, tid, a,
+                                f"[{tenant.business_name}] New Message on {a.ref_number} from {current_user.full_name}",
+                                f"{current_user.full_name} ({current_user.role}) posted on '{a.title}' ({a.ref_number}):\n\n\"{clean_msg}\""
+                            )
                             db.commit()
                             st.rerun()
 
@@ -1104,15 +1245,18 @@ else:
                                 db.add(AssignmentLog(tenant_id=tid, assignment_id=new_a.id,
                                                      actor_name=current_user.full_name,
                                                      action_note=f"Submitted request {ref_no} ({inv_no})."))
-                                tenant_admin = db.query(User).filter_by(tenant_id=tid, role="TENANT_ADMIN").first()
-                                if tenant_admin:
-                                    dispatch_email_notification(
-                                        db, tid, tenant_admin.email,
-                                        f"New Request [{ref_no}]: {clean_title}",
-                                        f"Client {current_user.full_name} submitted '{clean_title}'."
-                                    )
+                                notify_all_stakeholders(
+                                    db, tid, new_a,
+                                    f"[{tenant.business_name}] New Work Posted ({ref_no}): {clean_title}",
+                                    f"New assignment posted on {tenant.business_name}!\n"
+                                    f"Reference: {ref_no} | Invoice: {inv_no}\n"
+                                    f"Client: {current_user.full_name} ({current_user.email})\n"
+                                    f"Service: {srv.title} | Quoted: KES {srv.base_price_kes:,.0f}\n"
+                                    f"Deadline: {pref_deadline}\n"
+                                    f"Requirements: {task_desc}"
+                                )
                                 db.commit()
-                                st.success(f"Request submitted! Reference: **{ref_no}** | Invoice: **{inv_no}**")
+                                st.success(f"Request submitted and all stakeholders notified! Reference: **{ref_no}** | Invoice: **{inv_no}**")
                                 st.rerun()
 
     # --- TENANT ADMIN EXTRA TABS ---
@@ -1206,8 +1350,19 @@ else:
                         elif db.query(User).filter_by(email=st_email.strip()).first():
                             st.error("User with this email already exists.")
                         else:
-                            db.add(User(tenant_id=tid, full_name=st_name.strip(), email=st_email.strip(),
-                                        password_hash=hash_password(st_pass), role="STAFF"))
+                            new_staff = User(tenant_id=tid, full_name=st_name.strip(), email=st_email.strip(),
+                                             password_hash=hash_password(st_pass), role="STAFF")
+                            db.add(new_staff)
+                            notify_all_stakeholders(
+                                db, tid, None,
+                                f"[{tenant.business_name}] New Staff Added: {new_staff.full_name}",
+                                f"Staff member {new_staff.full_name} ({new_staff.email}) was added to {tenant.business_name}."
+                            )
+                            dispatch_email_notification(
+                                db, tid, new_staff.email,
+                                f"Welcome to {tenant.business_name} on AcadFlow",
+                                f"Hello {new_staff.full_name}, you have been added as Staff on {tenant.business_name}. Log in with your email and temporary password."
+                            )
                             db.commit()
                             st.rerun()
 
@@ -1220,12 +1375,18 @@ else:
                     sub_code = st.text_input("M-Pesa Code (Paybill 522522)", placeholder="e.g. SL992XYZ11")
                     if st.form_submit_button("Submit Subscription Payment") and sub_code.strip():
                         chosen_p = plan_opts[chosen_p_lbl]
+                        clean_sub_code = sub_code.strip().upper()
                         db.add(PlatformSubscriptionPayment(
                             tenant_id=tid, plan_name=chosen_p.name,
-                            amount_kes=chosen_p.monthly_price_kes, mpesa_code=sub_code.strip().upper(), status="Verified"
+                            amount_kes=chosen_p.monthly_price_kes, mpesa_code=clean_sub_code, status="Verified"
                         ))
                         tenant.tier = chosen_p.name
                         tenant.status = "Active"
+                        notify_all_stakeholders(
+                            db, tid, None,
+                            f"[AcadFlow] SaaS Subscription Payment: {tenant.business_name} ({chosen_p.name})",
+                            f"Workspace '{tenant.business_name}' paid KES {chosen_p.monthly_price_kes:,.0f} (M-Pesa: {clean_sub_code}) for {chosen_p.name}."
+                        )
                         db.commit()
                         st.success(f"Upgraded/Renewed on {chosen_p.name}!")
                         st.rerun()
@@ -1240,6 +1401,11 @@ else:
                             tenant_id=tid, business_name=tenant.business_name,
                             subject=tk_subj.strip(), description=tk_desc.strip()
                         ))
+                        notify_all_stakeholders(
+                            db, tid, None,
+                            f"[AcadFlow Support] New Ticket from {tenant.business_name}: {tk_subj.strip()}",
+                            f"Business: {tenant.business_name}\nSubject: {tk_subj.strip()}\n\n{tk_desc.strip()}"
+                        )
                         db.commit()
                         st.success("Support ticket sent to Super Admin!")
                         st.rerun()
