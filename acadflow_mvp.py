@@ -207,9 +207,11 @@ class PlatformSubscriptionPayment(Base):
     __tablename__ = "platform_subscriptions"
     id = Column(Integer, primary_key=True, index=True)
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    checkout_request_id = Column(String, default="")
     plan_name = Column(String, nullable=False)
     amount_kes = Column(Float, nullable=False)
     mpesa_code = Column(String, nullable=False)
+    phone_number = Column(String, default="")
     status = Column(String, default="Verified")
     paid_at = Column(DateTime, default=utc_now)
 
@@ -246,11 +248,18 @@ Base.metadata.create_all(bind=engine)
 try:
     with engine.begin() as conn:
         if DATABASE_URL.startswith("sqlite"):
-            cols = [row[1] for row in conn.execute(text("PRAGMA table_info(client_payments)")).fetchall()]
-            if "checkout_request_id" not in cols:
+            cp_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(client_payments)")).fetchall()]
+            if "checkout_request_id" not in cp_cols:
                 conn.execute(text("ALTER TABLE client_payments ADD COLUMN checkout_request_id VARCHAR"))
+            ps_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(platform_subscriptions)")).fetchall()]
+            if "checkout_request_id" not in ps_cols:
+                conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN checkout_request_id VARCHAR"))
+            if "phone_number" not in ps_cols:
+                conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN phone_number VARCHAR"))
         else:
             conn.execute(text("ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS checkout_request_id VARCHAR;"))
+            conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN IF NOT EXISTS checkout_request_id VARCHAR;"))
+            conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN IF NOT EXISTS phone_number VARCHAR;"))
 except Exception:
     pass
 
@@ -258,7 +267,7 @@ except Exception:
 # 3. EMAIL, PDF & DARAJA SERVICES
 # ==========================================
 def dispatch_email_notification(db, tenant_id: int | None, recipient: str, subject: str, body: str):
-    """Sends real SMTP email (supports port 587 STARTTLS and port 465 SSL) and records an auditable log."""
+    """Sends real SMTP email (port 587 STARTTLS or 465 SSL) and records an auditable log."""
     smtp_host = get_secret("SMTP_HOST")
     smtp_port = int(get_secret("SMTP_PORT", "587"))
     smtp_user = get_secret("SMTP_USER")
@@ -294,7 +303,6 @@ def notify_all_stakeholders(db, tenant_id: int | None, assignment: Assignment | 
     """Broadcasts notifications to Client, Assigned Staff, Tenant Admins, and Super Admin."""
     recipients = set()
 
-    # 1. Super Admin email from secrets + database SUPER_ADMIN accounts
     configured_super = get_secret("SUPER_ADMIN_EMAIL")
     if configured_super and "@" in configured_super:
         recipients.add(configured_super.strip().lower())
@@ -302,13 +310,11 @@ def notify_all_stakeholders(db, tenant_id: int | None, assignment: Assignment | 
         if sa.email and "@" in sa.email:
             recipients.add(sa.email.strip().lower())
 
-    # 2. All Tenant Admins for the workspace
     if tenant_id:
         for admin in db.query(User).filter_by(tenant_id=tenant_id, role="TENANT_ADMIN").all():
             if admin.email and "@" in admin.email:
                 recipients.add(admin.email.strip().lower())
 
-    # 3. Client & Assigned Staff on the specific assignment
     if assignment is not None:
         if assignment.client_id:
             client_u = db.query(User).filter_by(id=assignment.client_id).first()
@@ -396,23 +402,18 @@ def generate_financial_pdf(tenant: Tenant, assignment: Assignment, client: User,
 
     return bytes(pdf.output())
 
-def trigger_daraja_stk_push(tenant: Tenant, phone: str, amount: int, account_ref: str) -> dict:
+def _execute_daraja_stk(c_key: str, c_sec: str, passkey: str, shortcode: str, phone: str, amount: int, account_ref: str, desc: str, sim_prefix: str = "ws_CO") -> dict:
     clean_phone = phone.strip().replace("+", "")
     if clean_phone.startswith("0") and len(clean_phone) == 10:
         clean_phone = "254" + clean_phone[1:]
 
-    c_key = (tenant.daraja_consumer_key or "").strip() or get_secret("DARAJA_CONSUMER_KEY")
-    c_sec = (tenant.daraja_consumer_secret or "").strip() or get_secret("DARAJA_CONSUMER_SECRET")
-    passkey = (tenant.daraja_passkey or "").strip() or get_secret("DARAJA_PASSKEY")
-    shortcode = get_secret("DARAJA_SHORTCODE") or tenant.mpesa_paybill
     daraja_env = get_secret("DARAJA_ENV", "sandbox").strip().lower()
-
     if not (c_key and c_sec and passkey) or c_key.startswith("YOUR_"):
-        sim_id = f"ws_CO_{utc_now().strftime('%d%m%Y%H%M%S')}_{random.randint(1000,9999)}"
+        sim_id = f"{sim_prefix}_{utc_now().strftime('%d%m%Y%H%M%S')}_{random.randint(1000,9999)}"
         return {
             "mode": "SANDBOX_SIMULATION",
             "CheckoutRequestID": sim_id,
-            "CustomerMessage": f"Simulated STK Push sent to {clean_phone} for KES {amount:,.0f} (CheckoutRequestID: {sim_id})."
+            "CustomerMessage": f"Simulated STK Push sent to {clean_phone} for KES {amount:,.0f} (CheckoutID: {sim_id})."
         }
     try:
         base_api = "https://api.safaricom.co.ke" if daraja_env == "production" else "https://sandbox.safaricom.co.ke"
@@ -434,12 +435,26 @@ def trigger_daraja_stk_push(tenant: Tenant, phone: str, amount: int, account_ref
             "PhoneNumber": clean_phone,
             "CallBackURL": callback_url,
             "AccountReference": account_ref[:12],
-            "TransactionDesc": "AcadFlow Payment"
+            "TransactionDesc": desc
         }
         res = requests.post(stk_url, json=payload, headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
         return {"mode": "DARAJA_API", **res.json()}
     except Exception as exc:
         return {"mode": "DARAJA_API", "CustomerMessage": f"Daraja Error: {exc}"}
+
+def trigger_daraja_stk_push(tenant: Tenant, phone: str, amount: int, account_ref: str) -> dict:
+    c_key = (tenant.daraja_consumer_key or "").strip() or get_secret("DARAJA_CONSUMER_KEY")
+    c_sec = (tenant.daraja_consumer_secret or "").strip() or get_secret("DARAJA_CONSUMER_SECRET")
+    passkey = (tenant.daraja_passkey or "").strip() or get_secret("DARAJA_PASSKEY")
+    shortcode = get_secret("DARAJA_SHORTCODE") or tenant.mpesa_paybill
+    return _execute_daraja_stk(c_key, c_sec, passkey, shortcode, phone, amount, account_ref, "AcadFlow Payment", "ws_CO")
+
+def trigger_platform_subscription_stk(phone: str, amount: int, account_ref: str) -> dict:
+    c_key = get_secret("DARAJA_CONSUMER_KEY").strip()
+    c_sec = get_secret("DARAJA_CONSUMER_SECRET").strip()
+    passkey = get_secret("DARAJA_PASSKEY").strip()
+    shortcode = get_secret("DARAJA_SHORTCODE", "174379").strip()
+    return _execute_daraja_stk(c_key, c_sec, passkey, shortcode, phone, amount, account_ref, "AcadFlow Subscription", "ws_CO_SUB")
 
 # ==========================================
 # 4. SEED INITIAL DATA
@@ -741,12 +756,12 @@ if current_user.role == "SUPER_ADMIN":
     tenants = db.query(Tenant).all()
     sub_payments = db.query(PlatformSubscriptionPayment).all()
     plans = db.query(SubscriptionPlan).all()
-    total_saas_rev = sum(p.amount_kes for p in sub_payments)
+    total_saas_rev = sum(p.amount_kes for p in sub_payments if p.status == "Verified")
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Registered Businesses", len(tenants))
     m2.metric("Active / Trial Workspaces", sum(1 for t in tenants if t.status in ["Active", "Trial"]))
-    m3.metric("SaaS Subscription Revenue", f"KES {total_saas_rev:,.0f}")
+    m3.metric("Verified SaaS Revenue", f"KES {total_saas_rev:,.0f}")
     m4.metric("Total Platform Projects", db.query(Assignment).count())
 
     sa_tabs = st.tabs([
@@ -817,9 +832,31 @@ if current_user.role == "SUPER_ADMIN":
         df_subs = pd.DataFrame([{
             "Tenant ID": p.tenant_id, "Plan": p.plan_name,
             "Amount (KES)": p.amount_kes, "M-Pesa Receipt": p.mpesa_code,
-            "Status": p.status, "Date": p.paid_at.strftime("%Y-%m-%d")
+            "Checkout ID": getattr(p, "checkout_request_id", ""),
+            "Status": p.status, "Date": p.paid_at.strftime("%Y-%m-%d %H:%M")
         } for p in sub_payments])
         st.dataframe(df_subs, use_container_width=True)
+
+        # Manual verify fallback for pending subscription payments
+        pending_subs = [p for p in sub_payments if p.status != "Verified"]
+        if pending_subs:
+            st.markdown("**Pending Subscription Payments**")
+            for ps in pending_subs:
+                sc1, sc2 = st.columns([3, 1])
+                sc1.write(f"• Tenant #{ps.tenant_id} | Plan: **{ps.plan_name}** | KES {ps.amount_kes:,.0f} | Ref: `{ps.mpesa_code}`")
+                if sc2.button("✅ Approve & Activate", key=f"sa_sub_ver_{ps.id}"):
+                    ps.status = "Verified"
+                    t_obj = db.query(Tenant).filter_by(id=ps.tenant_id).first()
+                    if t_obj:
+                        t_obj.tier = ps.plan_name
+                        t_obj.status = "Active"
+                        notify_all_stakeholders(
+                            db, t_obj.id, None,
+                            f"[AcadFlow] Subscription Activated: {t_obj.business_name} ({ps.plan_name})",
+                            f"Your {ps.plan_name} subscription (KES {ps.amount_kes:,.0f}) has been verified and activated."
+                        )
+                    db.commit()
+                    st.rerun()
 
     with sa_tabs[3]:
         col_ann, col_sup = st.columns(2)
@@ -869,8 +906,58 @@ if current_user.role == "SUPER_ADMIN":
 # ==========================================
 else:
     tid = current_user.tenant_id
+
+    def render_subscription_stk_box():
+        st.subheader("📲 Upgrade / Renew AcadFlow Subscription (M-Pesa STK Push)")
+        all_plans = db.query(SubscriptionPlan).all()
+        plan_opts = {f"{p.name} — KES {p.monthly_price_kes:,.0f}/mo ({p.max_staff} staff, {p.max_active_projects} projects)": p for p in all_plans}
+        chosen_p_lbl = st.selectbox("Select Subscription Plan", list(plan_opts.keys()), key="sub_plan_sel")
+        sub_phone = st.text_input("M-Pesa Phone Number (2547XXXXXXXX or 07XXXXXXXX)", placeholder="0712345678", key="sub_stk_ph")
+
+        col_btn1, col_btn2 = st.columns([1.4, 1])
+        with col_btn1:
+            if st.button("📲 Send M-Pesa STK Push", type="primary", key="sub_stk_btn", use_container_width=True):
+                if not sub_phone.strip():
+                    st.error("Please enter a valid M-Pesa phone number.")
+                else:
+                    chosen_p = plan_opts[chosen_p_lbl]
+                    res = trigger_platform_subscription_stk(sub_phone, int(chosen_p.monthly_price_kes), f"SUB-{tenant.id}")
+                    chk_id = res.get("CheckoutRequestID", "")
+                    if chk_id:
+                        db.add(PlatformSubscriptionPayment(
+                            tenant_id=tid,
+                            checkout_request_id=chk_id,
+                            plan_name=chosen_p.name,
+                            amount_kes=chosen_p.monthly_price_kes,
+                            mpesa_code=f"PENDING-{chk_id[-8:]}",
+                            phone_number=sub_phone.strip(),
+                            status="Pending Verification"
+                        ))
+                        notify_all_stakeholders(
+                            db, tid, None,
+                            f"[AcadFlow] Subscription STK Push Initiated: {tenant.business_name} ({chosen_p.name})",
+                            f"{tenant.business_name} initiated an M-Pesa STK Push of KES {chosen_p.monthly_price_kes:,.0f} for the {chosen_p.name} plan (CheckoutID: {chk_id})."
+                        )
+                        db.commit()
+                    st.info(res.get("CustomerMessage", "STK Push sent! Enter your M-Pesa PIN to activate your plan automatically."))
+        with col_btn2:
+            if st.button("🔄 Refresh Plan Status", key="sub_refresh_btn", use_container_width=True):
+                st.rerun()
+
+        recent_subs = db.query(PlatformSubscriptionPayment).filter_by(tenant_id=tid).order_by(PlatformSubscriptionPayment.paid_at.desc()).limit(4).all()
+        if recent_subs:
+            st.markdown("**Recent Subscription Transactions:**")
+            for sp in recent_subs:
+                chk_display = f" | CheckoutID: `{sp.checkout_request_id}`" if getattr(sp, "checkout_request_id", "") else ""
+                st.caption(f"• **{sp.plan_name}** | KES {sp.amount_kes:,.0f} | Status: `{sp.status}` | Ref: `{sp.mpesa_code}`{chk_display}")
+
+    # If workspace is Suspended or Expired, let Tenant Admin pay via STK Push to reactivate automatically
     if tenant.status in ["Suspended", "Expired"]:
-        st.error(f"⛔ This workspace is currently **{tenant.status}**. Please renew your AcadFlow subscription or contact support.")
+        st.error(f"⛔ This workspace is currently **{tenant.status}**. Complete a subscription payment below to reactivate automatically.")
+        if current_user.role == "TENANT_ADMIN":
+            render_subscription_stk_box()
+        else:
+            st.info("Please ask your Workspace Administrator to renew the AcadFlow subscription.")
         st.stop()
 
     active_anns = db.query(PlatformAnnouncement).filter_by(is_active=True).order_by(PlatformAnnouncement.created_at.desc()).all()
@@ -1331,13 +1418,13 @@ else:
         with tabs[4]:
             st.subheader("Team Members, Subscription Plan & AcadFlow Support")
             if current_plan:
-                st.info(f"**Current Tier:** {current_plan.name} — Staff Used: **{len(staff_members)} / {current_plan.max_staff}** | "
+                st.info(f"**Current Tier:** {current_plan.name} ({tenant.status}) — Staff Used: **{len(staff_members)} / {current_plan.max_staff}** | "
                         f"Active Projects: **{active_tenant_projects_count} / {current_plan.max_active_projects}**")
 
             t_users = db.query(User).filter_by(tenant_id=tid).all()
             st.dataframe(pd.DataFrame([{"Name": u.full_name, "Email": u.email, "Role": u.role} for u in t_users]), use_container_width=True)
 
-            col_staff, col_saas, col_sup = st.columns(3)
+            col_staff, col_saas, col_sup = st.columns([1, 1.3, 1])
             with col_staff:
                 with st.form("invite_staff_form"):
                     st.markdown("**Add Staff / Researcher**")
@@ -1367,29 +1454,7 @@ else:
                             st.rerun()
 
             with col_saas:
-                with st.form("saas_renew_form"):
-                    st.markdown("**Upgrade / Renew AcadFlow (Ledger 1)**")
-                    all_plans = db.query(SubscriptionPlan).all()
-                    plan_opts = {f"{p.name} (KES {p.monthly_price_kes:,.0f}/mo)": p for p in all_plans}
-                    chosen_p_lbl = st.selectbox("Select Plan", list(plan_opts.keys()))
-                    sub_code = st.text_input("M-Pesa Code (Paybill 522522)", placeholder="e.g. SL992XYZ11")
-                    if st.form_submit_button("Submit Subscription Payment") and sub_code.strip():
-                        chosen_p = plan_opts[chosen_p_lbl]
-                        clean_sub_code = sub_code.strip().upper()
-                        db.add(PlatformSubscriptionPayment(
-                            tenant_id=tid, plan_name=chosen_p.name,
-                            amount_kes=chosen_p.monthly_price_kes, mpesa_code=clean_sub_code, status="Verified"
-                        ))
-                        tenant.tier = chosen_p.name
-                        tenant.status = "Active"
-                        notify_all_stakeholders(
-                            db, tid, None,
-                            f"[AcadFlow] SaaS Subscription Payment: {tenant.business_name} ({chosen_p.name})",
-                            f"Workspace '{tenant.business_name}' paid KES {chosen_p.monthly_price_kes:,.0f} (M-Pesa: {clean_sub_code}) for {chosen_p.name}."
-                        )
-                        db.commit()
-                        st.success(f"Upgraded/Renewed on {chosen_p.name}!")
-                        st.rerun()
+                render_subscription_stk_box()
 
             with col_sup:
                 with st.form("support_ticket_form"):
