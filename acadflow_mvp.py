@@ -21,10 +21,27 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///acadflow_mvp.db")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+def get_secret(key: str, default: str = "") -> str:
+    val = os.getenv(key)
+    if val:
+        return val
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        pass
+    return default
 
+DATABASE_URL = get_secret("DATABASE_URL", "sqlite:///acadflow_mvp.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+# Strip channel_binding parameter if present (prevents psycopg3 SSL errors on Linux)
+DATABASE_URL = DATABASE_URL.replace("&channel_binding=require", "").replace("?channel_binding=require", "")
+
+DEMO_MODE = get_secret("DEMO_MODE", "false").strip().lower() == "true"
 STORAGE_ROOT = "acadflow_storage"
 os.makedirs(STORAGE_ROOT, exist_ok=True)
 
@@ -230,11 +247,11 @@ Base.metadata.create_all(bind=engine)
 # 3. EMAIL, PDF & DARAJA SERVICES
 # ==========================================
 def dispatch_email_notification(db, tenant_id: int | None, recipient: str, subject: str, body: str):
-    """Sends real SMTP email if SMTP_HOST is configured in env; always records an auditable log."""
-    smtp_host = os.getenv("SMTP_HOST")
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_pass = os.getenv("SMTP_PASS")
-    status = "Logged (Configure SMTP_HOST env for live email)"
+    """Sends real SMTP email if SMTP_HOST is configured in env/secrets; always records an auditable log."""
+    smtp_host = get_secret("SMTP_HOST")
+    smtp_user = get_secret("SMTP_USER")
+    smtp_pass = get_secret("SMTP_PASS")
+    status = "Logged (Configure SMTP_HOST secret for live email)"
 
     if smtp_host and smtp_user and smtp_pass:
         try:
@@ -344,6 +361,7 @@ def trigger_daraja_stk_push(tenant: Tenant, phone: str, amount: int, account_ref
         timestamp = utc_now().strftime("%Y%m%d%H%M%S")
         password = base64.b64encode(f"{tenant.mpesa_paybill}{tenant.daraja_passkey}{timestamp}".encode()).decode()
         stk_url = "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
+        callback_url = get_secret("DARAJA_CALLBACK_URL", "https://acadflow.co.ke/api/mpesa/callback")
         payload = {
             "BusinessShortCode": tenant.mpesa_paybill,
             "Password": password,
@@ -353,7 +371,7 @@ def trigger_daraja_stk_push(tenant: Tenant, phone: str, amount: int, account_ref
             "PartyA": phone,
             "PartyB": tenant.mpesa_paybill,
             "PhoneNumber": phone,
-            "CallBackURL": "https://acadflow.co.ke/api/mpesa/callback",
+            "CallBackURL": callback_url,
             "AccountReference": account_ref[:12],
             "TransactionDesc": "AcadFlow Payment"
         }
@@ -367,23 +385,37 @@ def trigger_daraja_stk_push(tenant: Tenant, phone: str, amount: int, account_ref
 # ==========================================
 def seed_database():
     db = SessionLocal()
+    if db.query(SubscriptionPlan).count() == 0:
+        plans = [
+            SubscriptionPlan(name="Starter", monthly_price_kes=3500, annual_price_kes=35000,
+                             max_staff=2, max_active_projects=15,
+                             features_summary="Solo/small practice: Client portal, PDF invoices, 15 active projects."),
+            SubscriptionPlan(name="Professional", monthly_price_kes=6500, annual_price_kes=65000,
+                             max_staff=10, max_active_projects=75,
+                             features_summary="Growing consultancy: Team allocation, analytics, 10 staff, 75 active projects."),
+            SubscriptionPlan(name="Enterprise", monthly_price_kes=12000, annual_price_kes=120000,
+                             max_staff=100, max_active_projects=1000,
+                             features_summary="Full scale: Unlimited teams, Daraja API automation, priority support."),
+        ]
+        db.add_all(plans)
+        db.commit()
+
     if db.query(User).count() > 0:
         db.close()
         return
 
-    plans = [
-        SubscriptionPlan(name="Starter", monthly_price_kes=3500, annual_price_kes=35000,
-                         max_staff=2, max_active_projects=15,
-                         features_summary="Solo/small practice: Client portal, PDF invoices, 15 active projects."),
-        SubscriptionPlan(name="Professional", monthly_price_kes=6500, annual_price_kes=65000,
-                         max_staff=10, max_active_projects=75,
-                         features_summary="Growing consultancy: Team allocation, analytics, 10 staff, 75 active projects."),
-        SubscriptionPlan(name="Enterprise", monthly_price_kes=12000, annual_price_kes=120000,
-                         max_staff=100, max_active_projects=1000,
-                         features_summary="Full scale: Unlimited teams, Daraja API automation, priority support."),
-    ]
-    db.add_all(plans)
+    # Always ensure a Super Admin account exists on fresh databases
+    super_admin = User(
+        tenant_id=None, full_name="Platform Owner", email="super@acadflow.co.ke",
+        password_hash=hash_password("admin123"), role="SUPER_ADMIN"
+    )
+    db.add(super_admin)
     db.commit()
+
+    # Only seed sample demo workspaces if DEMO_MODE is explicitly enabled
+    if not DEMO_MODE:
+        db.close()
+        return
 
     t1 = Tenant(business_name="Nairobi Research & Thesis Hub (Your Business)", tier="Enterprise", status="Active",
                 mpesa_paybill="400200", mpesa_account="NRTH-01")
@@ -393,8 +425,6 @@ def seed_database():
     db.commit()
 
     users = [
-        User(tenant_id=None, full_name="Platform Owner (You)", email="super@acadflow.co.ke",
-             password_hash=hash_password("admin123"), role="SUPER_ADMIN"),
         User(tenant_id=t1.id, full_name="Dr. Kamau Njoroge (Admin)", email="admin@nairobihub.co.ke",
              password_hash=hash_password("admin123"), role="TENANT_ADMIN"),
         User(tenant_id=t1.id, full_name="Mercy Wanjiku (Senior Statistician)", email="mercy@nairobihub.co.ke",
@@ -455,7 +485,7 @@ def seed_database():
                                     amount_kes=3500, mpesa_code="SL104MNP92"),
     ])
     db.add(PlatformAnnouncement(
-        title="Welcome to AcadFlow v0.4",
+        title="Welcome to AcadFlow",
         message="Automated PDF Quotations/Invoices and M-Pesa STK Push integration are now live across all workspaces!"
     ))
     db.commit()
@@ -488,7 +518,10 @@ if not current_user:
     st.caption("From Submission to Completion — Multi-Tenant Academic & Research Project Management SaaS")
     st.divider()
 
-    col_auth, col_demo = st.columns([1.3, 1])
+    if DEMO_MODE:
+        col_auth, col_demo = st.columns([1.3, 1])
+    else:
+        col_auth = st.container()
 
     with col_auth:
         auth_tab1, auth_tab2, auth_tab3 = st.tabs(["🔐 Sign In", "🎓 Client Sign-Up", "🏢 Register a Business"])
@@ -496,7 +529,7 @@ if not current_user:
         with auth_tab1:
             email = st.text_input("Email Address", key="login_email")
             password = st.text_input("Password", type="password", key="login_pass")
-            if st.button("Log In", type="primary", width="stretch"):
+            if st.button("Log In", type="primary", use_container_width=True):
                 user = db.query(User).filter(User.email == email.strip()).first()
                 if user and user.password_hash == hash_password(password):
                     st.session_state.user_id = user.id
@@ -507,28 +540,31 @@ if not current_user:
         with auth_tab2:
             st.subheader("Create a Client Account")
             active_tenants = db.query(Tenant).filter(Tenant.status.in_(["Active", "Trial"])).all()
-            with st.form("client_reg_form"):
-                t_map = {t.business_name: t.id for t in active_tenants}
-                chosen_biz = st.selectbox("Select Academic / Research Consultancy", list(t_map.keys()))
-                c_name = st.text_input("Your Full Name")
-                c_email = st.text_input("Email Address")
-                c_pass = st.text_input("Create Password", type="password")
-                if st.form_submit_button("Register as Client", type="primary"):
-                    if c_name and c_email and c_pass:
-                        if db.query(User).filter_by(email=c_email.strip()).first():
-                            st.error("An account with this email already exists.")
-                        else:
-                            new_client = User(
-                                tenant_id=t_map[chosen_biz],
-                                full_name=c_name.strip(),
-                                email=c_email.strip(),
-                                password_hash=hash_password(c_pass),
-                                role="CLIENT"
-                            )
-                            db.add(new_client)
-                            db.commit()
-                            st.session_state.user_id = new_client.id
-                            st.rerun()
+            if not active_tenants:
+                st.info("No active consultancies are accepting public registrations yet.")
+            else:
+                with st.form("client_reg_form"):
+                    t_map = {t.business_name: t.id for t in active_tenants}
+                    chosen_biz = st.selectbox("Select Academic / Research Consultancy", list(t_map.keys()))
+                    c_name = st.text_input("Your Full Name")
+                    c_email = st.text_input("Email Address")
+                    c_pass = st.text_input("Create Password", type="password")
+                    if st.form_submit_button("Register as Client", type="primary"):
+                        if c_name and c_email and c_pass:
+                            if db.query(User).filter_by(email=c_email.strip()).first():
+                                st.error("An account with this email already exists.")
+                            else:
+                                new_client = User(
+                                    tenant_id=t_map[chosen_biz],
+                                    full_name=c_name.strip(),
+                                    email=c_email.strip(),
+                                    password_hash=hash_password(c_pass),
+                                    role="CLIENT"
+                                )
+                                db.add(new_client)
+                                db.commit()
+                                st.session_state.user_id = new_client.id
+                                st.rerun()
 
         with auth_tab3:
             st.subheader("Start Your 14-Day Free Trial")
@@ -561,24 +597,26 @@ if not current_user:
                             st.session_state.user_id = new_admin.id
                             st.rerun()
 
-    with col_demo:
-        st.info("⚡ **Prototype Quick-Login (Test Multi-Tenancy & Roles)**")
-        demo_accounts = [
-            ("👑 Super Admin (Platform Owner)", "super@acadflow.co.ke"),
-            ("🏢 Tenant 1 Admin (Nairobi Research Hub)", "admin@nairobihub.co.ke"),
-            ("🔬 Tenant 1 Staff (Mercy - Statistician)", "mercy@nairobihub.co.ke"),
-            ("🎓 Tenant 1 Client (Brian - MSc Student)", "brian@student.ac.ke"),
-            ("🏢 Tenant 2 Admin (ScholarAssist Kenya)", "admin@scholarassist.co.ke"),
-        ]
-        for label, demo_email in demo_accounts:
-            if st.button(label, width="stretch"):
-                u = db.query(User).filter_by(email=demo_email).first()
-                st.session_state.user_id = u.id
-                st.rerun()
+    if DEMO_MODE:
+        with col_demo:
+            st.info("⚡ **Prototype Quick-Login (Test Multi-Tenancy & Roles)**")
+            demo_accounts = [
+                ("👑 Super Admin (Platform Owner)", "super@acadflow.co.ke"),
+                ("🏢 Tenant 1 Admin (Nairobi Research Hub)", "admin@nairobihub.co.ke"),
+                ("🔬 Tenant 1 Staff (Mercy - Statistician)", "mercy@nairobihub.co.ke"),
+                ("🎓 Tenant 1 Client (Brian - MSc Student)", "brian@student.ac.ke"),
+                ("🏢 Tenant 2 Admin (ScholarAssist Kenya)", "admin@scholarassist.co.ke"),
+            ]
+            for label, demo_email in demo_accounts:
+                if st.button(label, use_container_width=True):
+                    u = db.query(User).filter_by(email=demo_email).first()
+                    if u:
+                        st.session_state.user_id = u.id
+                        st.rerun()
     st.stop()
 
 # ==========================================
-# 7. AUTHENTICATED SIDEBAR
+# 7. AUTHENTICATED SIDEBAR & ACCOUNT SECURITY
 # ==========================================
 tenant = db.query(Tenant).filter_by(id=current_user.tenant_id).first() if current_user.tenant_id else None
 
@@ -589,10 +627,31 @@ with st.sidebar:
     else:
         st.warning("**Mode:** Central Platform Control (Super Admin)")
 
-    st.markdown(f"**User:** {current_user.full_name}  \n**Role:** `{current_user.role}`")
+    st.markdown(f"**User:** {current_user.full_name}  \n**Email:** `{current_user.email}`  \n**Role:** `{current_user.role}`")
     st.divider()
 
-    if st.button("🚪 Sign Out", width="stretch"):
+    with st.expander("🔑 Account & Password Security"):
+        with st.form("change_own_pass_form"):
+            new_email_val = st.text_input("Login Email", value=current_user.email)
+            curr_pw = st.text_input("Current Password", type="password")
+            new_pw = st.text_input("New Password (min 6 chars)", type="password")
+            if st.form_submit_button("Update Credentials"):
+                if current_user.password_hash != hash_password(curr_pw):
+                    st.error("Current password is incorrect.")
+                elif new_pw and len(new_pw) < 6:
+                    st.error("New password must be at least 6 characters.")
+                else:
+                    clean_em = new_email_val.strip()
+                    if clean_em != current_user.email and db.query(User).filter_by(email=clean_em).first():
+                        st.error("That email is already in use.")
+                    else:
+                        current_user.email = clean_em
+                        if new_pw:
+                            current_user.password_hash = hash_password(new_pw)
+                        db.commit()
+                        st.success("Account credentials updated!")
+
+    if st.button("🚪 Sign Out", use_container_width=True):
         st.session_state.user_id = None
         st.rerun()
 
@@ -621,6 +680,8 @@ if current_user.role == "SUPER_ADMIN":
     ])
 
     with sa_tabs[0]:
+        if not tenants:
+            st.info("No subscribing businesses registered yet.")
         for t in tenants:
             t_assign_count = db.query(Assignment).filter_by(tenant_id=t.id).count()
             t_staff_count = db.query(User).filter(User.tenant_id == t.id, User.role.in_(["TENANT_ADMIN", "STAFF"])).count()
@@ -628,15 +689,29 @@ if current_user.role == "SUPER_ADMIN":
                 c1, c2, c3, c4 = st.columns([2, 1, 1.2, 1.3])
                 c1.write(f"**Paybill/Till:** {t.mpesa_paybill} ({t.mpesa_account})")
                 c2.write(f"**Staff:** {t_staff_count} | **Projects:** {t_assign_count}")
-                new_tier = c3.selectbox("Subscription Tier", [p.name for p in plans],
-                                        index=[p.name for p in plans].index(t.tier), key=f"tr_{t.id}")
-                new_status = c4.selectbox("Account Status", ["Active", "Trial", "Suspended", "Expired"],
-                                          index=["Active", "Trial", "Suspended", "Expired"].index(t.status), key=f"st_{t.id}")
+                tier_names = [p.name for p in plans]
+                tier_idx = tier_names.index(t.tier) if t.tier in tier_names else 0
+                new_tier = c3.selectbox("Subscription Tier", tier_names, index=tier_idx, key=f"tr_{t.id}")
+                status_opts = ["Active", "Trial", "Suspended", "Expired"]
+                st_idx = status_opts.index(t.status) if t.status in status_opts else 0
+                new_status = c4.selectbox("Account Status", status_opts, index=st_idx, key=f"st_{t.id}")
                 if new_status != t.status or new_tier != t.tier:
                     t.status = new_status
                     t.tier = new_tier
                     db.commit()
                     st.rerun()
+
+                # User password reset / governance for this workspace
+                t_users = db.query(User).filter_by(tenant_id=t.id).all()
+                if t_users:
+                    u_col1, u_col2, u_col3 = st.columns([2, 1.5, 1])
+                    u_map = {f"{u.full_name} ({u.email} - {u.role})": u for u in t_users}
+                    sel_u_lbl = u_col1.selectbox("Workspace User", list(u_map.keys()), key=f"su_sel_{t.id}")
+                    reset_pw_val = u_col2.text_input("New Password", type="password", key=f"su_pw_{t.id}")
+                    if u_col3.button("Reset User Password", key=f"su_btn_{t.id}") and len(reset_pw_val) >= 6:
+                        u_map[sel_u_lbl].password_hash = hash_password(reset_pw_val)
+                        db.commit()
+                        st.success("User password reset!")
 
     with sa_tabs[1]:
         st.subheader("Configure AcadFlow SaaS Tiers & Usage Limits")
@@ -662,7 +737,7 @@ if current_user.role == "SUPER_ADMIN":
             "Amount (KES)": p.amount_kes, "M-Pesa Receipt": p.mpesa_code,
             "Status": p.status, "Date": p.paid_at.strftime("%Y-%m-%d")
         } for p in sub_payments])
-        st.dataframe(df_subs, width="stretch")
+        st.dataframe(df_subs, use_container_width=True)
 
     with sa_tabs[3]:
         col_ann, col_sup = st.columns(2)
@@ -700,7 +775,7 @@ if current_user.role == "SUPER_ADMIN":
         st.dataframe(pd.DataFrame([{
             "To": l.recipient_email, "Subject": l.subject, "Status": l.delivery_status,
             "Sent At": l.sent_at.strftime("%Y-%m-%d %H:%M")
-        } for l in logs]), width="stretch")
+        } for l in logs]), use_container_width=True)
 
 # ==========================================
 # 9. TENANT WORKSPACE (ADMIN / STAFF / CLIENT)
@@ -711,7 +786,6 @@ else:
         st.error(f"⛔ This workspace is currently **{tenant.status}**. Please renew your AcadFlow subscription or contact support.")
         st.stop()
 
-    # Show active platform-wide announcements
     active_anns = db.query(PlatformAnnouncement).filter_by(is_active=True).order_by(PlatformAnnouncement.created_at.desc()).all()
     for ann in active_anns[:1]:
         st.info(f"📢 **{ann.title}:** {ann.message}")
@@ -777,7 +851,6 @@ else:
                         "📜 Audit Trail"
                     ])
 
-                    # SUBTAB 1: OVERVIEW & DUPLICATE-SAFE CONTROLS
                     with sub_t1:
                         col_info, col_manage = st.columns([1.4, 1])
                         with col_info:
@@ -789,7 +862,6 @@ else:
                                         f"Paid `KES {a.amount_paid_kes:,.0f}` | "
                                         f"Balance `KES {balance:,.0f}`")
 
-                            # Show review if completed
                             existing_rev = db.query(ClientReview).filter_by(assignment_id=a.id).first()
                             if existing_rev:
                                 st.success(f"⭐ **Client Rating:** {'⭐' * existing_rev.rating} ({existing_rev.rating}/5) — _{existing_rev.feedback}_")
@@ -872,7 +944,6 @@ else:
                                             db.commit()
                                             st.rerun()
 
-                    # SUBTAB 2: PDF QUOTATION / INVOICE & M-PESA
                     with sub_t2:
                         pdf_bytes = generate_financial_pdf(tenant, a, client_obj, srv_obj.title if srv_obj else "Academic Service")
                         pdf_label = "📄 Download PDF Quotation" if a.status in ["1. Submitted", "2. Under review", "3. Quotation sent"] else "🧾 Download PDF Invoice / Receipt"
@@ -930,7 +1001,6 @@ else:
                                         st.success("Payment submitted for Admin verification!")
                                         st.rerun()
 
-                    # SUBTAB 3: DUPLICATE-PROOF FILES
                     with sub_t3:
                         docs = db.query(AssignmentDocument).filter_by(tenant_id=tid, assignment_id=a.id).all()
                         for d in docs:
@@ -961,7 +1031,6 @@ else:
                                 db.commit()
                                 st.rerun()
 
-                    # SUBTAB 4: DISCUSSION
                     with sub_t4:
                         msgs = db.query(AssignmentMessage).filter_by(tenant_id=tid, assignment_id=a.id).order_by(AssignmentMessage.sent_at.asc()).all()
                         for m in msgs:
@@ -976,13 +1045,12 @@ else:
                             db.commit()
                             st.rerun()
 
-                    # SUBTAB 5: AUDIT TRAIL
                     with sub_t5:
                         logs = db.query(AssignmentLog).filter_by(tenant_id=tid, assignment_id=a.id).order_by(AssignmentLog.timestamp.desc()).all()
                         for lg in logs:
                             st.caption(f"[{lg.timestamp.strftime('%Y-%m-%d %H:%M')}] **{lg.actor_name}**: {lg.action_note}")
 
-    # --- CLIENT TAB 2: DUPLICATE-PROOF SUBMISSION WITH TIER LIMIT ENFORCEMENT ---
+    # --- CLIENT TAB 2: DUPLICATE-PROOF SUBMISSION ---
     if current_user.role == "CLIENT":
         with tabs[1]:
             st.subheader("Submit a New Academic / Research Request")
@@ -1049,7 +1117,6 @@ else:
 
     # --- TENANT ADMIN EXTRA TABS ---
     if current_user.role == "TENANT_ADMIN":
-        # TAB 2: ANALYTICS & CLIENT REVIEWS
         with tabs[1]:
             st.subheader("Workspace Performance & Client Satisfaction")
             reviews = db.query(ClientReview).filter_by(tenant_id=tid).all()
@@ -1071,7 +1138,6 @@ else:
                 for r in reviews:
                     st.write(f"• {'⭐' * r.rating} **{r.client_name}**: _{r.feedback}_")
 
-        # TAB 3: SERVICE CATALOGUE
         with tabs[2]:
             st.subheader("Business Service Catalogue")
             for s in services:
@@ -1092,7 +1158,6 @@ else:
                         db.commit()
                         st.rerun()
 
-        # TAB 4: FINANCIALS & M-PESA
         with tabs[3]:
             st.subheader("Client Financials & Daraja API Configuration (Ledger 2)")
             with st.form("mpesa_cfg_form"):
@@ -1117,9 +1182,8 @@ else:
                 "Balance (KES)": max(0.0, a.quoted_cost_kes - a.amount_paid_kes),
                 "Status": a.status
             } for a in assignments]
-            st.dataframe(pd.DataFrame(fin_rows), width="stretch")
+            st.dataframe(pd.DataFrame(fin_rows), use_container_width=True)
 
-        # TAB 5: TEAM, SUBSCRIPTION LIMITS & SUPPORT
         with tabs[4]:
             st.subheader("Team Members, Subscription Plan & AcadFlow Support")
             if current_plan:
@@ -1127,7 +1191,7 @@ else:
                         f"Active Projects: **{active_tenant_projects_count} / {current_plan.max_active_projects}**")
 
             t_users = db.query(User).filter_by(tenant_id=tid).all()
-            st.dataframe(pd.DataFrame([{"Name": u.full_name, "Email": u.email, "Role": u.role} for u in t_users]), width="stretch")
+            st.dataframe(pd.DataFrame([{"Name": u.full_name, "Email": u.email, "Role": u.role} for u in t_users]), use_container_width=True)
 
             col_staff, col_saas, col_sup = st.columns(3)
             with col_staff:
@@ -1135,8 +1199,8 @@ else:
                     st.markdown("**Add Staff / Researcher**")
                     st_name = st.text_input("Staff Full Name")
                     st_email = st.text_input("Staff Email")
-                    st_pass = st.text_input("Temporary Password", value="staff123")
-                    if st.form_submit_button("Add Staff Member") and st_name and st_email:
+                    st_pass = st.text_input("Temporary Password", type="password")
+                    if st.form_submit_button("Add Staff Member") and st_name and st_email and st_pass:
                         if current_plan and len(staff_members) >= current_plan.max_staff:
                             st.error(f"Staff limit reached ({current_plan.max_staff}) for {current_plan.name} plan. Please upgrade!")
                         elif db.query(User).filter_by(email=st_email.strip()).first():
