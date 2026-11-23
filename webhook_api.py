@@ -1,10 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
-from database import (
-    Base, engine, SessionLocal, Tenant, User,
-    Assignment, ClientPaymentTransaction, PlatformSubscriptionPayment
-)
+from sqlalchemy import text, Column, Integer, String, Float, DateTime
+from database import Base, engine, SessionLocal, Assignment, ClientPaymentTransaction
 
 # Ensure tables and checkout_request_id columns exist on both ledgers
 Base.metadata.create_all(bind=engine)
@@ -22,7 +19,7 @@ def health_check():
 
 @app.post("/api/mpesa/callback")
 async def mpesa_stk_callback(request: Request):
-    """Receives Safaricom Daraja STK Push callback for both Client Projects and Tenant SaaS Subscriptions."""
+    """Receives Safaricom Daraja STK Push callback for both Tenant SaaS Subscriptions and Client Projects."""
     try:
         payload = await request.json()
     except Exception:
@@ -44,27 +41,38 @@ async def mpesa_stk_callback(request: Request):
 
     db = SessionLocal()
     try:
-        # 1. Check Ledger 1: Tenant SaaS Subscription Payment
-        sub_tx = db.query(PlatformSubscriptionPayment).filter_by(checkout_request_id=checkout_id).first()
-        if sub_tx:
-            if sub_tx.status != "Verified":
-                sub_tx.mpesa_code = mpesa_receipt
-                sub_tx.amount_kes = amount
-                sub_tx.phone_number = phone
-                sub_tx.status = "Verified"
+        # 1. Check Ledger 1: Tenant SaaS Subscription Payment (via direct SQL so no extra model imports are needed)
+        if checkout_id:
+            sub_row = db.execute(
+                text("SELECT id, tenant_id, plan_name, status FROM platform_subscriptions WHERE checkout_request_id = :cid LIMIT 1"),
+                {"cid": checkout_id}
+            ).fetchone()
 
-                tenant = db.query(Tenant).filter_by(id=sub_tx.tenant_id).first()
-                if tenant:
-                    tenant.tier = sub_tx.plan_name
-                    tenant.status = "Active"
-                db.commit()
-            return {"ResultCode": 0, "ResultDesc": "Subscription Activated"}
+            if sub_row:
+                if sub_row.status != "Verified":
+                    db.execute(
+                        text("""
+                            UPDATE platform_subscriptions
+                            SET mpesa_code = :code, amount_kes = :amt, phone_number = :ph, status = 'Verified'
+                            WHERE id = :sid
+                        """),
+                        {"code": mpesa_receipt, "amt": amount, "ph": phone, "sid": sub_row.id}
+                    )
+                    db.execute(
+                        text("UPDATE tenants SET tier = :tier, status = 'Active' WHERE id = :tid"),
+                        {"tier": sub_row.plan_name, "tid": sub_row.tenant_id}
+                    )
+                    db.commit()
+                return {"ResultCode": 0, "ResultDesc": "Subscription Activated"}
 
         # 2. Check Ledger 2: Client Assignment Payment
         if mpesa_receipt and db.query(ClientPaymentTransaction).filter_by(mpesa_code=mpesa_receipt).first():
             return {"ResultCode": 0, "ResultDesc": "Already processed"}
 
-        pending_tx = db.query(ClientPaymentTransaction).filter_by(checkout_request_id=checkout_id).first()
+        pending_tx = None
+        if checkout_id and hasattr(ClientPaymentTransaction, "checkout_request_id"):
+            pending_tx = db.query(ClientPaymentTransaction).filter_by(checkout_request_id=checkout_id).first()
+
         if pending_tx:
             pending_tx.mpesa_code = mpesa_receipt
             pending_tx.amount_kes = amount
