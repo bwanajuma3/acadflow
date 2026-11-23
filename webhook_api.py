@@ -1,9 +1,12 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from database import Base, engine, SessionLocal, Assignment, ClientPaymentTransaction
 
-# Ensure all tables defined in database.py exist in Neon PostgreSQL on startup
+# Ensure all tables exist and migrate missing columns safely on startup
 Base.metadata.create_all(bind=engine)
+with engine.begin() as conn:
+    conn.execute(text("ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS checkout_request_id VARCHAR;"))
 
 app = FastAPI(title="AcadFlow M-Pesa Daraja Webhook Service")
 
