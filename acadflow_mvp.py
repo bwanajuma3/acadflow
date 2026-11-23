@@ -11,7 +11,7 @@ import random
 from fpdf import FPDF
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, Boolean,
-    DateTime, ForeignKey, Text, text
+    DateTime, ForeignKey, Text, text, func
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -45,8 +45,17 @@ DEMO_MODE = get_secret("DEMO_MODE", "false").strip().lower() == "true"
 STORAGE_ROOT = "acadflow_storage"
 os.makedirs(STORAGE_ROOT, exist_ok=True)
 
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
+connect_args = (
+    {"check_same_thread": False}
+    if DATABASE_URL.startswith("sqlite")
+    else {"connect_timeout": 10}
+)
+engine = create_engine(
+    DATABASE_URL,
+    connect_args=connect_args,
+    pool_pre_ping=True,
+    pool_recycle=300
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -73,6 +82,15 @@ def utc_now() -> datetime:
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
+
+def normalize_email(email_str: str) -> str:
+    return (email_str or "").strip().lower()
+
+def find_user_by_email(db, email_str: str):
+    clean = normalize_email(email_str)
+    if not clean:
+        return None
+    return db.query(User).filter(func.lower(User.email) == clean).first()
 
 def compute_file_sha256(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
@@ -254,48 +272,166 @@ class EmailNotificationLog(Base):
     delivery_status = Column(String, default="Queued / Logged")
     sent_at = Column(DateTime, default=utc_now)
 
-Base.metadata.create_all(bind=engine)
-try:
-    with engine.begin() as conn:
-        if DATABASE_URL.startswith("sqlite"):
-            cp_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(client_payments)")).fetchall()]
-            if "checkout_request_id" not in cp_cols:
-                conn.execute(text("ALTER TABLE client_payments ADD COLUMN checkout_request_id VARCHAR"))
-            ps_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(platform_subscriptions)")).fetchall()]
-            if "checkout_request_id" not in ps_cols:
-                conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN checkout_request_id VARCHAR"))
-            if "phone_number" not in ps_cols:
-                conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN phone_number VARCHAR"))
-            am_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(assignment_messages)")).fetchall()]
-            if "channel" not in am_cols:
-                conn.execute(text("ALTER TABLE assignment_messages ADD COLUMN channel VARCHAR DEFAULT 'CLIENT_CHAT'"))
-            u_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(users)")).fetchall()]
-            if "commission_rate" not in u_cols:
-                conn.execute(text("ALTER TABLE users ADD COLUMN commission_rate FLOAT DEFAULT 50.0"))
-            a_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(assignments)")).fetchall()]
-            if "staff_commission_pct" not in a_cols:
-                conn.execute(text("ALTER TABLE assignments ADD COLUMN staff_commission_pct FLOAT DEFAULT 50.0"))
-            if "staff_payout_status" not in a_cols:
-                conn.execute(text("ALTER TABLE assignments ADD COLUMN staff_payout_status VARCHAR DEFAULT 'Unpaid'"))
-            if "staff_payout_mpesa" not in a_cols:
-                conn.execute(text("ALTER TABLE assignments ADD COLUMN staff_payout_mpesa VARCHAR DEFAULT ''"))
-            if "staff_paid_at" not in a_cols:
-                conn.execute(text("ALTER TABLE assignments ADD COLUMN staff_paid_at DATETIME"))
-        else:
-            conn.execute(text("ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS checkout_request_id VARCHAR;"))
-            conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN IF NOT EXISTS checkout_request_id VARCHAR;"))
-            conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN IF NOT EXISTS phone_number VARCHAR;"))
-            conn.execute(text("ALTER TABLE assignment_messages ADD COLUMN IF NOT EXISTS channel VARCHAR DEFAULT 'CLIENT_CHAT';"))
-            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS commission_rate FLOAT DEFAULT 50.0;"))
-            conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS staff_commission_pct FLOAT DEFAULT 50.0;"))
-            conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS staff_payout_status VARCHAR DEFAULT 'Unpaid';"))
-            conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS staff_payout_mpesa VARCHAR DEFAULT '';"))
-            conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS staff_paid_at TIMESTAMP;"))
-except Exception:
-    pass
+# ==========================================
+# 3. SEED & CACHED STARTUP INITIALIZATION
+# ==========================================
+def seed_database():
+    db = SessionLocal()
+    try:
+        if db.query(SubscriptionPlan).count() == 0:
+            plans = [
+                SubscriptionPlan(name="Starter", monthly_price_kes=3500, annual_price_kes=35000,
+                                 max_staff=2, max_active_projects=15,
+                                 features_summary="Solo/small practice: Client portal, PDF invoices, 15 active projects."),
+                SubscriptionPlan(name="Professional", monthly_price_kes=6500, annual_price_kes=65000,
+                                 max_staff=10, max_active_projects=75,
+                                 features_summary="Growing consultancy: Team allocation, analytics, 10 staff, 75 active projects."),
+                SubscriptionPlan(name="Enterprise", monthly_price_kes=12000, annual_price_kes=120000,
+                                 max_staff=100, max_active_projects=1000,
+                                 features_summary="Full scale: Unlimited teams, Daraja API automation, priority support."),
+            ]
+            db.add_all(plans)
+            db.commit()
+
+        if db.query(User).count() > 0:
+            return
+
+        super_admin_email = normalize_email(get_secret("SUPER_ADMIN_EMAIL", "super@acadflow.co.ke"))
+        super_admin = User(
+            tenant_id=None, full_name="Platform Owner", email=super_admin_email,
+            password_hash=hash_password("admin123"), role="SUPER_ADMIN"
+        )
+        db.add(super_admin)
+        db.commit()
+
+        if not DEMO_MODE:
+            return
+
+        t1 = Tenant(business_name="Nairobi Research & Thesis Hub (Your Business)", tier="Enterprise", status="Active",
+                    mpesa_paybill="400200", mpesa_account="NRTH-01")
+        t2 = Tenant(business_name="ScholarAssist Kenya Ltd", tier="Starter", status="Active",
+                    mpesa_paybill="247247", mpesa_account="SCHOLAR-KE")
+        db.add_all([t1, t2])
+        db.commit()
+
+        users = [
+            User(tenant_id=t1.id, full_name="Dr. Kamau Njoroge (Admin)", email="admin@nairobihub.co.ke",
+                 password_hash=hash_password("admin123"), role="TENANT_ADMIN", commission_rate=0.0),
+            User(tenant_id=t1.id, full_name="Mercy Wanjiku (Senior Statistician)", email="mercy@nairobihub.co.ke",
+                 password_hash=hash_password("staff123"), role="STAFF", commission_rate=55.0),
+            User(tenant_id=t1.id, full_name="Brian Ochieng (MSc Client)", email="brian@student.ac.ke",
+                 password_hash=hash_password("client123"), role="CLIENT"),
+            User(tenant_id=t2.id, full_name="Grace Mutua (Admin)", email="admin@scholarassist.co.ke",
+                 password_hash=hash_password("admin123"), role="TENANT_ADMIN", commission_rate=0.0),
+            User(tenant_id=t2.id, full_name="David Kiprop (PhD Client)", email="david@university.ac.ke",
+                 password_hash=hash_password("client123"), role="CLIENT"),
+        ]
+        db.add_all(users)
+        db.commit()
+
+        s1 = Service(tenant_id=t1.id, title="SPSS / R Statistical Data Analysis",
+                     description="Quantitative analysis, regression modeling, and APA tables.", base_price_kes=15000, turnaround_days=4)
+        s2 = Service(tenant_id=t1.id, title="Research Proposal Development",
+                     description="Chapters 1-3 structuring, methodology design, and literature synthesis.", base_price_kes=25000, turnaround_days=7)
+        s3 = Service(tenant_id=t2.id, title="Academic Editing & Proofreading",
+                     description="Language polishing, citation verification, and formatting.", base_price_kes=8000, turnaround_days=2)
+        db.add_all([s1, s2, s3])
+        db.commit()
+
+        brian = find_user_by_email(db, "brian@student.ac.ke")
+        mercy = find_user_by_email(db, "mercy@nairobihub.co.ke")
+        david = find_user_by_email(db, "david@university.ac.ke")
+
+        a1 = Assignment(
+            tenant_id=t1.id, ref_number="AF-2026-1001", invoice_number="INV-2026-1001",
+            title="Panel Data Regression for SME Credit Access",
+            description="Need STATA/R regression analysis on 5-year CBK dataset (300 firms).",
+            service_id=s1.id, client_id=brian.id, staff_id=mercy.id,
+            status="7. In progress", priority="High",
+            quoted_cost_kes=18000, amount_paid_kes=10000,
+            staff_commission_pct=55.0,
+            deadline=utc_now() + timedelta(days=3)
+        )
+        a2 = Assignment(
+            tenant_id=t2.id, ref_number="AF-2026-2001", invoice_number="INV-2026-2001",
+            title="PhD Thesis Chapter 4 Formatting & Citation Audit",
+            description="APA 7th edition compliance check for 120-page manuscript.",
+            service_id=s3.id, client_id=david.id, staff_id=None,
+            status="1. Submitted", priority="Normal",
+            quoted_cost_kes=9500, amount_paid_kes=0,
+            deadline=utc_now() + timedelta(days=5)
+        )
+        db.add_all([a1, a2])
+        db.commit()
+
+        db.add(AssignmentLog(tenant_id=t1.id, assignment_id=a1.id, actor_name="System",
+                             action_note="Assignment submitted and assigned to Mercy Wanjiku."))
+        db.add(ClientPaymentTransaction(tenant_id=t1.id, assignment_id=a1.id,
+                                        amount_kes=10000, mpesa_code="SK901ABC22",
+                                        phone_number="254712345678", status="Verified"))
+        db.add_all([
+            PlatformSubscriptionPayment(tenant_id=t1.id, plan_name="Enterprise (Annual)",
+                                        amount_kes=120000, mpesa_code="SK892JKL10"),
+            PlatformSubscriptionPayment(tenant_id=t2.id, plan_name="Starter (Monthly)",
+                                        amount_kes=3500, mpesa_code="SL104MNP92"),
+        ])
+        db.add(PlatformAnnouncement(
+            title="Welcome to AcadFlow",
+            message="Automated PDF Quotations/Invoices, M-Pesa STK Push, and Staff Commission Tracking are live!"
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+@st.cache_resource
+def init_database_once():
+    """Runs schema creation, lightweight migrations, and initial seeding once per container startup."""
+    Base.metadata.create_all(bind=engine)
+    try:
+        with engine.begin() as conn:
+            if DATABASE_URL.startswith("sqlite"):
+                cp_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(client_payments)")).fetchall()]
+                if "checkout_request_id" not in cp_cols:
+                    conn.execute(text("ALTER TABLE client_payments ADD COLUMN checkout_request_id VARCHAR"))
+                ps_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(platform_subscriptions)")).fetchall()]
+                if "checkout_request_id" not in ps_cols:
+                    conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN checkout_request_id VARCHAR"))
+                if "phone_number" not in ps_cols:
+                    conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN phone_number VARCHAR"))
+                am_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(assignment_messages)")).fetchall()]
+                if "channel" not in am_cols:
+                    conn.execute(text("ALTER TABLE assignment_messages ADD COLUMN channel VARCHAR DEFAULT 'CLIENT_CHAT'"))
+                u_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(users)")).fetchall()]
+                if "commission_rate" not in u_cols:
+                    conn.execute(text("ALTER TABLE users ADD COLUMN commission_rate FLOAT DEFAULT 50.0"))
+                a_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(assignments)")).fetchall()]
+                if "staff_commission_pct" not in a_cols:
+                    conn.execute(text("ALTER TABLE assignments ADD COLUMN staff_commission_pct FLOAT DEFAULT 50.0"))
+                if "staff_payout_status" not in a_cols:
+                    conn.execute(text("ALTER TABLE assignments ADD COLUMN staff_payout_status VARCHAR DEFAULT 'Unpaid'"))
+                if "staff_payout_mpesa" not in a_cols:
+                    conn.execute(text("ALTER TABLE assignments ADD COLUMN staff_payout_mpesa VARCHAR DEFAULT ''"))
+                if "staff_paid_at" not in a_cols:
+                    conn.execute(text("ALTER TABLE assignments ADD COLUMN staff_paid_at DATETIME"))
+            else:
+                conn.execute(text("ALTER TABLE client_payments ADD COLUMN IF NOT EXISTS checkout_request_id VARCHAR;"))
+                conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN IF NOT EXISTS checkout_request_id VARCHAR;"))
+                conn.execute(text("ALTER TABLE platform_subscriptions ADD COLUMN IF NOT EXISTS phone_number VARCHAR;"))
+                conn.execute(text("ALTER TABLE assignment_messages ADD COLUMN IF NOT EXISTS channel VARCHAR DEFAULT 'CLIENT_CHAT';"))
+                conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS commission_rate FLOAT DEFAULT 50.0;"))
+                conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS staff_commission_pct FLOAT DEFAULT 50.0;"))
+                conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS staff_payout_status VARCHAR DEFAULT 'Unpaid';"))
+                conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS staff_payout_mpesa VARCHAR DEFAULT '';"))
+                conn.execute(text("ALTER TABLE assignments ADD COLUMN IF NOT EXISTS staff_paid_at TIMESTAMP;"))
+    except Exception:
+        pass
+    seed_database()
+    return True
+
+init_database_once()
 
 # ==========================================
-# 3. COMMISSION, TURNAROUND & EMAIL SERVICES
+# 4. COMMISSION, TURNAROUND & EMAIL SERVICES
 # ==========================================
 def compute_assignment_commission(db, assignment: Assignment) -> dict:
     """Calculates Staff Earnings, Agency Net Profit, and payout eligibility (Paid + Deliverable Approved)."""
@@ -398,25 +534,25 @@ def notify_all_stakeholders(db, tenant_id: int | None, assignment: Assignment | 
 
     configured_super = get_secret("SUPER_ADMIN_EMAIL")
     if configured_super and "@" in configured_super:
-        recipients.add(configured_super.strip().lower())
+        recipients.add(normalize_email(configured_super))
     for sa in db.query(User).filter_by(role="SUPER_ADMIN").all():
         if sa.email and "@" in sa.email:
-            recipients.add(sa.email.strip().lower())
+            recipients.add(normalize_email(sa.email))
 
     if tenant_id:
         for admin in db.query(User).filter_by(tenant_id=tenant_id, role="TENANT_ADMIN").all():
             if admin.email and "@" in admin.email:
-                recipients.add(admin.email.strip().lower())
+                recipients.add(normalize_email(admin.email))
 
     if assignment is not None:
         if include_client and assignment.client_id:
             client_u = db.query(User).filter_by(id=assignment.client_id).first()
             if client_u and client_u.email:
-                recipients.add(client_u.email.strip().lower())
+                recipients.add(normalize_email(client_u.email))
         if assignment.staff_id:
             staff_u = db.query(User).filter_by(id=assignment.staff_id).first()
             if staff_u and staff_u.email:
-                recipients.add(staff_u.email.strip().lower())
+                recipients.add(normalize_email(staff_u.email))
 
     for email_addr in sorted(recipients):
         dispatch_email_notification(db, tenant_id, email_addr, subject, body)
@@ -550,119 +686,6 @@ def trigger_platform_subscription_stk(phone: str, amount: int, account_ref: str)
     return _execute_daraja_stk(c_key, c_sec, passkey, shortcode, phone, amount, account_ref, "AcadFlow Subscription", "ws_CO_SUB")
 
 # ==========================================
-# 4. SEED INITIAL DATA
-# ==========================================
-def seed_database():
-    db = SessionLocal()
-    if db.query(SubscriptionPlan).count() == 0:
-        plans = [
-            SubscriptionPlan(name="Starter", monthly_price_kes=3500, annual_price_kes=35000,
-                             max_staff=2, max_active_projects=15,
-                             features_summary="Solo/small practice: Client portal, PDF invoices, 15 active projects."),
-            SubscriptionPlan(name="Professional", monthly_price_kes=6500, annual_price_kes=65000,
-                             max_staff=10, max_active_projects=75,
-                             features_summary="Growing consultancy: Team allocation, analytics, 10 staff, 75 active projects."),
-            SubscriptionPlan(name="Enterprise", monthly_price_kes=12000, annual_price_kes=120000,
-                             max_staff=100, max_active_projects=1000,
-                             features_summary="Full scale: Unlimited teams, Daraja API automation, priority support."),
-        ]
-        db.add_all(plans)
-        db.commit()
-
-    if db.query(User).count() > 0:
-        db.close()
-        return
-
-    super_admin_email = get_secret("SUPER_ADMIN_EMAIL", "super@acadflow.co.ke").strip()
-    super_admin = User(
-        tenant_id=None, full_name="Platform Owner", email=super_admin_email,
-        password_hash=hash_password("admin123"), role="SUPER_ADMIN"
-    )
-    db.add(super_admin)
-    db.commit()
-
-    if not DEMO_MODE:
-        db.close()
-        return
-
-    t1 = Tenant(business_name="Nairobi Research & Thesis Hub (Your Business)", tier="Enterprise", status="Active",
-                mpesa_paybill="400200", mpesa_account="NRTH-01")
-    t2 = Tenant(business_name="ScholarAssist Kenya Ltd", tier="Starter", status="Active",
-                mpesa_paybill="247247", mpesa_account="SCHOLAR-KE")
-    db.add_all([t1, t2])
-    db.commit()
-
-    users = [
-        User(tenant_id=t1.id, full_name="Dr. Kamau Njoroge (Admin)", email="admin@nairobihub.co.ke",
-             password_hash=hash_password("admin123"), role="TENANT_ADMIN", commission_rate=0.0),
-        User(tenant_id=t1.id, full_name="Mercy Wanjiku (Senior Statistician)", email="mercy@nairobihub.co.ke",
-             password_hash=hash_password("staff123"), role="STAFF", commission_rate=55.0),
-        User(tenant_id=t1.id, full_name="Brian Ochieng (MSc Client)", email="brian@student.ac.ke",
-             password_hash=hash_password("client123"), role="CLIENT"),
-        User(tenant_id=t2.id, full_name="Grace Mutua (Admin)", email="admin@scholarassist.co.ke",
-             password_hash=hash_password("admin123"), role="TENANT_ADMIN", commission_rate=0.0),
-        User(tenant_id=t2.id, full_name="David Kiprop (PhD Client)", email="david@university.ac.ke",
-             password_hash=hash_password("client123"), role="CLIENT"),
-    ]
-    db.add_all(users)
-    db.commit()
-
-    s1 = Service(tenant_id=t1.id, title="SPSS / R Statistical Data Analysis",
-                 description="Quantitative analysis, regression modeling, and APA tables.", base_price_kes=15000, turnaround_days=4)
-    s2 = Service(tenant_id=t1.id, title="Research Proposal Development",
-                 description="Chapters 1-3 structuring, methodology design, and literature synthesis.", base_price_kes=25000, turnaround_days=7)
-    s3 = Service(tenant_id=t2.id, title="Academic Editing & Proofreading",
-                 description="Language polishing, citation verification, and formatting.", base_price_kes=8000, turnaround_days=2)
-    db.add_all([s1, s2, s3])
-    db.commit()
-
-    brian = db.query(User).filter_by(email="brian@student.ac.ke").first()
-    mercy = db.query(User).filter_by(email="mercy@nairobihub.co.ke").first()
-    david = db.query(User).filter_by(email="david@university.ac.ke").first()
-
-    a1 = Assignment(
-        tenant_id=t1.id, ref_number="AF-2026-1001", invoice_number="INV-2026-1001",
-        title="Panel Data Regression for SME Credit Access",
-        description="Need STATA/R regression analysis on 5-year CBK dataset (300 firms).",
-        service_id=s1.id, client_id=brian.id, staff_id=mercy.id,
-        status="7. In progress", priority="High",
-        quoted_cost_kes=18000, amount_paid_kes=10000,
-        staff_commission_pct=55.0,
-        deadline=utc_now() + timedelta(days=3)
-    )
-    a2 = Assignment(
-        tenant_id=t2.id, ref_number="AF-2026-2001", invoice_number="INV-2026-2001",
-        title="PhD Thesis Chapter 4 Formatting & Citation Audit",
-        description="APA 7th edition compliance check for 120-page manuscript.",
-        service_id=s3.id, client_id=david.id, staff_id=None,
-        status="1. Submitted", priority="Normal",
-        quoted_cost_kes=9500, amount_paid_kes=0,
-        deadline=utc_now() + timedelta(days=5)
-    )
-    db.add_all([a1, a2])
-    db.commit()
-
-    db.add(AssignmentLog(tenant_id=t1.id, assignment_id=a1.id, actor_name="System",
-                         action_note="Assignment submitted and assigned to Mercy Wanjiku."))
-    db.add(ClientPaymentTransaction(tenant_id=t1.id, assignment_id=a1.id,
-                                    amount_kes=10000, mpesa_code="SK901ABC22",
-                                    phone_number="254712345678", status="Verified"))
-    db.add_all([
-        PlatformSubscriptionPayment(tenant_id=t1.id, plan_name="Enterprise (Annual)",
-                                    amount_kes=120000, mpesa_code="SK892JKL10"),
-        PlatformSubscriptionPayment(tenant_id=t2.id, plan_name="Starter (Monthly)",
-                                    amount_kes=3500, mpesa_code="SL104MNP92"),
-    ])
-    db.add(PlatformAnnouncement(
-        title="Welcome to AcadFlow",
-        message="Automated PDF Quotations/Invoices, M-Pesa STK Push, and Staff Commission Tracking are live!"
-    ))
-    db.commit()
-    db.close()
-
-seed_database()
-
-# ==========================================
 # 5. STREAMLIT APP & SESSION
 # ==========================================
 st.set_page_config(page_title="AcadFlow | Academic Project SaaS", page_icon="🎓", layout="wide")
@@ -699,7 +722,7 @@ if not current_user:
             email = st.text_input("Email Address", key="login_email")
             password = st.text_input("Password", type="password", key="login_pass")
             if st.button("Log In", type="primary", use_container_width=True):
-                user = db.query(User).filter(User.email == email.strip()).first()
+                user = find_user_by_email(db, email)
                 if user and user.password_hash == hash_password(password):
                     st.session_state.user_id = user.id
                     st.rerun()
@@ -716,20 +739,19 @@ if not current_user:
                     t_map = {t.business_name: t.id for t in active_tenants}
                     chosen_biz = st.selectbox("Primary Consultancy (You can switch anytime per project)", list(t_map.keys()))
                     default_tid = t_map[chosen_biz]
-                else:
-                    chosen_biz = "AcadFlow Marketplace"
                 c_name = st.text_input("Your Full Name")
                 c_email = st.text_input("Email Address")
                 c_pass = st.text_input("Create Password", type="password")
                 if st.form_submit_button("Register as Client", type="primary"):
-                    if c_name and c_email and c_pass:
-                        if db.query(User).filter_by(email=c_email.strip()).first():
+                    clean_c_email = normalize_email(c_email)
+                    if c_name.strip() and clean_c_email and c_pass:
+                        if find_user_by_email(db, clean_c_email):
                             st.error("An account with this email already exists.")
                         else:
                             new_client = User(
                                 tenant_id=default_tid,
                                 full_name=c_name.strip(),
-                                email=c_email.strip(),
+                                email=clean_c_email,
                                 password_hash=hash_password(c_pass),
                                 role="CLIENT"
                             )
@@ -748,6 +770,8 @@ if not current_user:
                             db.commit()
                             st.session_state.user_id = new_client.id
                             st.rerun()
+                    else:
+                        st.error("Please fill in your full name, email address, and password.")
 
         with auth_tab3:
             st.subheader("Start Your 14-Day Free Trial")
@@ -759,10 +783,11 @@ if not current_user:
                 adm_email = st.text_input("Work Email")
                 adm_pass = st.text_input("Password", type="password")
                 if st.form_submit_button("Create Business Workspace", type="primary"):
-                    if biz_name and adm_name and adm_email and adm_pass:
+                    clean_adm_email = normalize_email(adm_email)
+                    if biz_name.strip() and adm_name.strip() and clean_adm_email and adm_pass:
                         if db.query(Tenant).filter_by(business_name=biz_name.strip()).first():
                             st.error("Business name already registered.")
-                        elif db.query(User).filter_by(email=adm_email.strip()).first():
+                        elif find_user_by_email(db, clean_adm_email):
                             st.error("Email already registered.")
                         else:
                             new_tenant = Tenant(business_name=biz_name.strip(), tier=biz_tier, status="Trial")
@@ -771,7 +796,7 @@ if not current_user:
                             new_admin = User(
                                 tenant_id=new_tenant.id,
                                 full_name=adm_name.strip(),
-                                email=adm_email.strip(),
+                                email=clean_adm_email,
                                 password_hash=hash_password(adm_pass),
                                 role="TENANT_ADMIN",
                                 commission_rate=0.0
@@ -786,6 +811,8 @@ if not current_user:
                             db.commit()
                             st.session_state.user_id = new_admin.id
                             st.rerun()
+                    else:
+                        st.error("Please fill in all fields to register your workspace.")
 
     if DEMO_MODE:
         with col_demo:
@@ -799,7 +826,7 @@ if not current_user:
             ]
             for label, demo_email in demo_accounts:
                 if st.button(label, use_container_width=True):
-                    u = db.query(User).filter_by(email=demo_email).first()
+                    u = find_user_by_email(db, demo_email)
                     if u:
                         st.session_state.user_id = u.id
                         st.rerun()
@@ -834,8 +861,9 @@ with st.sidebar:
                 elif new_pw and len(new_pw) < 6:
                     st.error("New password must be at least 6 characters.")
                 else:
-                    clean_em = new_email_val.strip()
-                    if clean_em != current_user.email and db.query(User).filter_by(email=clean_em).first():
+                    clean_em = normalize_email(new_email_val)
+                    existing_em_user = find_user_by_email(db, clean_em)
+                    if clean_em != normalize_email(current_user.email) and existing_em_user:
                         st.error("That email is already in use.")
                     else:
                         current_user.email = clean_em
@@ -1118,7 +1146,6 @@ else:
             st.divider()
 
         elif current_user.role == "STAFF":
-            # Staff "My Earnings & Payouts" Summary Card
             earned_payable = 0.0
             pending_pipeline = 0.0
             total_paid_out = 0.0
@@ -1234,12 +1261,8 @@ else:
                                                 changes.append(f"Assigned to {sel_staff}")
                                                 a.staff_id = new_sid
                                                 if chosen:
-                                                    # Inherit staff member's default commission rate if not explicitly changed
                                                     staff_def_rate = float(getattr(chosen, "commission_rate", 50.0) or 50.0)
-                                                    if new_comm_pct == default_pct_val:
-                                                        a.staff_commission_pct = staff_def_rate
-                                                    else:
-                                                        a.staff_commission_pct = new_comm_pct
+                                                    a.staff_commission_pct = staff_def_rate if new_comm_pct == default_pct_val else new_comm_pct
                                                 if a.status in ["1. Submitted", "5. Payment confirmed"] and new_sid is not None:
                                                     a.status = "6. Assigned"
                                             elif new_comm_pct != default_pct_val:
@@ -1829,7 +1852,6 @@ else:
                 "Default Commission (%)": f"{getattr(u, 'commission_rate', 50.0):.0f}%" if u.role == "STAFF" else "-"
             } for u in t_users]), use_container_width=True)
 
-            # Quick default commission rate editor for existing staff
             only_staff = [u for u in t_users if u.role == "STAFF"]
             if only_staff:
                 with st.expander("⚙️ Adjust Default Commission Rate for Existing Staff"):
@@ -1852,14 +1874,17 @@ else:
                     st_email = st.text_input("Staff Email")
                     st_rate = st.number_input("Default Commission Share (%)", min_value=0.0, max_value=100.0, value=50.0, step=5.0)
                     st_pass = st.text_input("Temporary Password", type="password")
-                    if st.form_submit_button("Add Staff Member") and st_name and st_email and st_pass:
-                        if current_plan and len(staff_members) >= current_plan.max_staff:
+                    if st.form_submit_button("Add Staff Member"):
+                        clean_st_email = normalize_email(st_email)
+                        if not (st_name.strip() and clean_st_email and st_pass):
+                            st.error("Please fill in staff name, email, and temporary password.")
+                        elif current_plan and len(staff_members) >= current_plan.max_staff:
                             st.error(f"Staff limit reached ({current_plan.max_staff}) for {current_plan.name} plan. Please upgrade!")
-                        elif db.query(User).filter_by(email=st_email.strip()).first():
+                        elif find_user_by_email(db, clean_st_email):
                             st.error("User with this email already exists.")
                         else:
                             new_staff = User(
-                                tenant_id=tid, full_name=st_name.strip(), email=st_email.strip(),
+                                tenant_id=tid, full_name=st_name.strip(), email=clean_st_email,
                                 password_hash=hash_password(st_pass), role="STAFF", commission_rate=st_rate
                             )
                             db.add(new_staff)
