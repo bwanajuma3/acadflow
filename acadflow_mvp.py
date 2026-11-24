@@ -38,6 +38,18 @@ def get_secret(key: str, default: str = "") -> str:
         pass
     return default
 
+def build_daraja_callback_url() -> str:
+    """Builds the authenticated Daraja STK Push callback URL using the shared webhook token."""
+    callback_url = get_secret(
+        "DARAJA_CALLBACK_URL",
+        "https://acadflow-webhook.onrender.com/api/payments/daraja-callback",
+    ).strip()
+    webhook_token = get_secret("DARAJA_WEBHOOK_TOKEN").strip()
+    if webhook_token and "token=" not in callback_url:
+        sep = "&" if "?" in callback_url else "?"
+        callback_url = f"{callback_url}{sep}token={webhook_token}"
+    return callback_url
+
 DATABASE_URL = get_secret("DATABASE_URL", "sqlite:///acadflow_mvp.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
@@ -812,7 +824,7 @@ def _execute_daraja_stk(c_key: str, c_sec: str, passkey: str, shortcode: str, ph
         password = base64.b64encode(f"{shortcode}{passkey}{timestamp}".encode()).decode()
         stk_url = f"{base_api}/mpesa/stkpush/v1/processrequest"
 
-        callback_url = get_secret("DARAJA_CALLBACK_URL", "https://acadflow-webhook.onrender.com/api/mpesa/callback").strip()
+        callback_url = get_secret("DARAJA_CALLBACK_URL", "https://acadflow-webhook.onrender.com/api/payments/daraja-callback").strip()
         webhook_token = get_secret("DARAJA_WEBHOOK_TOKEN").strip()
         if webhook_token and "token=" not in callback_url:
             sep = "&" if "?" in callback_url else "?"
