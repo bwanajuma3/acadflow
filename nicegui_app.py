@@ -180,6 +180,18 @@ def has_client_accepted_work(logs: list[AssignmentLog]) -> bool:
     return accepted
 
 
+def is_order_verified_closed(asg: Assignment, logs: list[AssignmentLog] | None = None) -> bool:
+    """True only if paid in full on-platform AND accepted/completed."""
+    paid_full = float(asg.amount_paid_kes or 0) >= float(asg.quoted_cost_kes or 0) and float(asg.quoted_cost_kes or 0) > 0
+    if not paid_full:
+        return False
+    if asg.status == "Completed":
+        return True
+    if logs is not None and has_client_accepted_work(logs):
+        return True
+    return False
+
+
 def get_status_badge_color(status: str | None) -> str:
     st = (status or "").strip().lower()
     if st == "completed":
@@ -198,28 +210,49 @@ def get_status_badge_color(status: str | None) -> str:
 
 
 def get_rated_tenants(db) -> dict[int, str]:
-    """Returns tenant_id -> 'Agency Name — ⭐ 4.9/5 (12 reviews)' sorted highest rated first."""
+    """
+    Returns tenant_id -> formatted badge label sorted highest verified rating first.
+    ONLY orders paid & accepted inside AcadFlow count toward star ratings, completed count,
+    and the 'Top Rated Agency' badge.
+    """
     tenants = db.query(Tenant).filter(Tenant.status != "Suspended").all()
     reviews = db.query(ClientReview).all()
+    all_asgs = db.query(Assignment).all()
+
+    verified_asg_ids = {
+        a.id
+        for a in all_asgs
+        if a.status == "Completed" and float(a.amount_paid_kes or 0) >= float(a.quoted_cost_kes or 0)
+    }
+
+    completed_by_tenant: dict[int, int] = {t.id: 0 for t in tenants}
+    for a in all_asgs:
+        if a.id in verified_asg_ids and a.tenant_id in completed_by_tenant:
+            completed_by_tenant[a.tenant_id] += 1
 
     scores_by_tenant: dict[int, list[int]] = {t.id: [] for t in tenants}
     for rev in reviews:
-        if rev.tenant_id in scores_by_tenant and rev.rating is not None:
+        if rev.tenant_id in scores_by_tenant and rev.rating is not None and rev.assignment_id in verified_asg_ids:
             scores_by_tenant[rev.tenant_id].append(int(rev.rating))
 
     ranked = []
     for t in tenants:
         ratings = scores_by_tenant.get(t.id, [])
+        done_cnt = completed_by_tenant.get(t.id, 0)
         if ratings:
             avg = sum(ratings) / len(ratings)
-            label = f"{t.business_name} — ⭐ {avg:.1f}/5 ({len(ratings)} review{'s' if len(ratings) != 1 else ''})"
-            ranked.append((avg, len(ratings), t.business_name.lower(), t.id, label))
+            top_badge = " | 🏆 Top Rated Agency" if (avg >= 4.5 and len(ratings) >= 2) else ""
+            label = (
+                f"{t.business_name} — ⭐ {avg:.1f}/5 ({len(ratings)} verified review{'s' if len(ratings) != 1 else ''}, "
+                f"{done_cnt} verified order{'s' if done_cnt != 1 else ''}){top_badge}"
+            )
+            ranked.append((avg, len(ratings), done_cnt, t.business_name.lower(), t.id, label))
         else:
-            label = f"{t.business_name} — ⭐ New Agency (No reviews yet)"
-            ranked.append((-1.0, 0, t.business_name.lower(), t.id, label))
+            label = f"{t.business_name} — ⭐ New Agency ({done_cnt} verified order{'s' if done_cnt != 1 else ''})"
+            ranked.append((-1.0, 0, done_cnt, t.business_name.lower(), t.id, label))
 
-    ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
-    return {item[3]: item[4] for item in ranked}
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
+    return {item[4]: item[5] for item in ranked}
 
 
 def get_active_announcements(db) -> list[PlatformAnnouncement]:
@@ -308,6 +341,34 @@ def send_tenant_stk_push(tenant: Tenant, assignment: Assignment, phone: str, amo
     )
 
 
+def send_writer_payout_stk_push(
+    tenant: Tenant,
+    assignment: Assignment,
+    tenant_admin_phone: str,
+    writer_name: str,
+    amount_kes: float,
+) -> tuple[bool, str]:
+    """
+    Sends an M-Pesa STK prompt to the Tenant Admin's phone so the agency pays
+    the writer's earned commission (never sent to the client).
+    """
+    ck = os.getenv("PLATFORM_DARAJA_CONSUMER_KEY", "").strip() or decrypt_secret(tenant.daraja_consumer_key)
+    cs = os.getenv("PLATFORM_DARAJA_CONSUMER_SECRET", "").strip() or decrypt_secret(tenant.daraja_consumer_secret)
+    pk = os.getenv("PLATFORM_DARAJA_PASSKEY", "").strip() or decrypt_secret(tenant.daraja_passkey)
+    sc = os.getenv("PLATFORM_MPESA_PAYBILL", "").strip() or (tenant.mpesa_paybill or "").strip()
+
+    return execute_daraja_stk_push(
+        consumer_key=ck,
+        consumer_secret=cs,
+        passkey=pk,
+        shortcode=sc,
+        account_ref=f"PAY-{assignment.ref_number}",
+        tx_desc=f"Staff {writer_name[:7]}",
+        phone=tenant_admin_phone,
+        amount_kes=amount_kes,
+    )
+
+
 def send_subscription_stk_push(tenant: Tenant, plan_name: str, phone: str, amount_kes: float) -> tuple[bool, str]:
     ck = os.getenv("PLATFORM_DARAJA_CONSUMER_KEY", "").strip() or decrypt_secret(tenant.daraja_consumer_key)
     cs = os.getenv("PLATFORM_DARAJA_CONSUMER_SECRET", "").strip() or decrypt_secret(tenant.daraja_consumer_secret)
@@ -361,7 +422,7 @@ def kpi_card(title: str, value: str, subtitle: str, icon: str, icon_color: str) 
 
 
 # ---------------------------------------------------------------------------
-# 1. UNIFIED LOGIN, CLIENT SIGNUP (EMAIL + PHONE) & AGENCY REGISTRATION
+# 1. UNIFIED LOGIN, PUBLIC SERVICES CATALOG, CLIENT SIGNUP & AGENCY REGISTRATION
 # ---------------------------------------------------------------------------
 @ui.page("/login")
 def login_page() -> None:
@@ -377,22 +438,39 @@ def login_page() -> None:
     db = SessionLocal()
     try:
         rated_tenant_options = get_rated_tenants(db)
+        active_tenants = db.query(Tenant).filter(Tenant.status != "Suspended").all()
+        active_tenant_map = {t.id: t.business_name for t in active_tenants}
+        all_services = (
+            db.query(Service)
+            .filter(Service.tenant_id.in_(list(active_tenant_map.keys())))
+            .order_by(Service.id.desc())
+            .all()
+            if active_tenant_map
+            else []
+        )
     finally:
         db.close()
 
     with ui.column().classes("w-full min-h-screen items-center justify-center bg-slate-900 p-4"):
-        with ui.card().classes("w-full max-w-md p-8 rounded-2xl shadow-2xl bg-white border border-slate-200"):
-            with ui.row().classes("items-center gap-3 mb-1"):
-                ui.icon("school", size="32px").classes("text-emerald-600")
-                ui.label("AcadFlow").classes("text-2xl font-bold tracking-tight text-slate-900")
+        with ui.card().classes("w-full max-w-2xl p-8 rounded-2xl shadow-2xl bg-white border border-slate-200"):
+            with ui.row().classes("items-center justify-between w-full mb-1"):
+                with ui.row().classes("items-center gap-3"):
+                    ui.icon("school", size="32px").classes("text-emerald-600")
+                    ui.label("AcadFlow").classes("text-2xl font-bold tracking-tight text-slate-900")
+                ui.badge("ESCROW PROTECTED", color="emerald").classes("text-[10px] font-bold px-2 py-0.5")
             ui.label("Multi-Tenant Academic Agency & M-Pesa OS").classes("text-xs text-slate-500 mb-4")
 
             with ui.tabs().classes("w-full mb-4") as tabs:
-                login_tab = ui.tab("Sign In")
-                client_tab = ui.tab("Client Sign Up")
-                agency_tab = ui.tab("New Agency")
+                login_tab = ui.tab("Sign In", icon="login")
+                services_tab = ui.tab("Browse Services", icon="search")
+                client_tab = ui.tab("Client Sign Up", icon="person_add")
+                agency_tab = ui.tab("New Agency", icon="add_business")
+
+            # Shared agency selection reference so clicking "Order from Agency" in Browse Services jumps right to Client Sign Up
+            selected_agency_holder = {"value": next(iter(rated_tenant_options.keys()), None)}
 
             with ui.tab_panels(tabs, value=login_tab).classes("w-full"):
+                # --- TAB 1: SIGN IN ---
                 with ui.tab_panel(login_tab).classes("p-0"):
                     email_input = ui.input("Email Address", placeholder="you@example.com").classes("w-full mb-3").props("outlined dense")
                     password_input = ui.input("Password", password=True, password_toggle_button=True).classes("w-full mb-5").props("outlined dense")
@@ -452,14 +530,115 @@ def login_page() -> None:
                         "w-full py-2.5 rounded-lg bg-slate-900 text-white font-semibold hover:bg-slate-800"
                     )
 
+                # --- TAB 2: PUBLIC SERVICES MARKETPLACE DIRECTORY (ALL TENANTS) ---
+                with ui.tab_panel(services_tab).classes("p-0 gap-3"):
+                    with ui.row().classes("w-full items-center justify-between gap-2 mb-2"):
+                        with ui.column().classes("gap-0"):
+                            ui.label("Explore Services Across All Verified Agencies").classes("text-base font-bold text-slate-900")
+                            ui.label("Search available academic & writing services before creating your client account.").classes("text-xs text-slate-500")
+
+                    svc_search = ui.input(
+                        placeholder="Search service (e.g., Dissertation, Essay, Data Analysis, Turnitin, Agency name)..."
+                    ).props("outlined dense clearable").classes("w-full mb-2")
+
+                    svc_results_box = ui.column().classes("w-full max-h-80 overflow-y-auto gap-2.5 pr-1")
+
+                    def choose_agency_for_signup(tid: int) -> None:
+                        selected_agency_holder["value"] = tid
+                        agency_sel.value = tid
+                        agency_sel.update()
+                        refresh_selected_agency_services()
+                        tabs.set_value(client_tab)
+
+                    def render_public_services() -> None:
+                        svc_results_box.clear()
+                        q = (svc_search.value or "").strip().lower()
+                        filtered = [
+                            s
+                            for s in all_services
+                            if not q
+                            or q in (s.title or "").lower()
+                            or q in (s.description or "").lower()
+                            or q in active_tenant_map.get(s.tenant_id, "").lower()
+                        ]
+
+                        with svc_results_box:
+                            if not all_services:
+                                ui.label("No agency service packages have been published yet. You can still sign up and submit a custom brief.").classes("text-xs text-slate-500 p-3 bg-slate-50 rounded-lg")
+                                return
+                            if not filtered:
+                                ui.label(f"No services matched '{svc_search.value}'. Try a broader keyword or select an agency in Client Sign Up.").classes("text-xs text-slate-500 p-3 bg-slate-50 rounded-lg")
+                                return
+
+                            for s in filtered:
+                                ag_badge = rated_tenant_options.get(s.tenant_id, active_tenant_map.get(s.tenant_id, "Agency"))
+                                with ui.card().classes("w-full p-3.5 rounded-xl bg-slate-50 border border-slate-200 shadow-none"):
+                                    with ui.row().classes("w-full items-start justify-between gap-3"):
+                                        with ui.column().classes("gap-0.5 flex-1"):
+                                            ui.label(s.title).classes("text-sm font-bold text-slate-900")
+                                            ui.label(ag_badge).classes("text-[11px] font-semibold text-emerald-700")
+                                            if s.description:
+                                                ui.label(s.description).classes("text-xs text-slate-600 mt-1")
+                                        with ui.column().classes("items-end gap-1"):
+                                            ui.badge(f"KES {float(s.base_price_kes or 0):,.0f}", color="primary").classes("text-xs font-bold")
+                                            ui.label(f"{s.turnaround_days} day turnaround").classes("text-[11px] text-slate-500")
+                                            ui.button(
+                                                "Select & Sign Up",
+                                                icon="arrow_forward",
+                                                on_click=lambda tid=s.tenant_id: choose_agency_for_signup(tid),
+                                            ).props("dense unelevated color=positive").classes("text-xs mt-1")
+
+                    svc_search.on_value_change(lambda _: render_public_services())
+                    render_public_services()
+
+                # --- TAB 3: CLIENT SIGN UP (WITH SELECTED AGENCY SERVICES PREVIEW + ESCROW NOTICE) ---
                 with ui.tab_panel(client_tab).classes("p-0"):
+                    with ui.row().classes("w-full items-center gap-2 bg-emerald-50 border border-emerald-200 text-emerald-950 p-2.5 rounded-lg mb-3"):
+                        ui.icon("verified_user", size="18px").classes("text-emerald-700")
+                        ui.label(
+                            "Payments made inside AcadFlow are held in Escrow until you click Accept Work."
+                        ).classes("text-xs font-medium")
+
                     agency_sel = ui.select(
                         rated_tenant_options,
-                        label="Choose Agency (Ranked by Client Reviews)",
-                    ).classes("w-full mb-3").props("outlined dense")
-                    reg_name = ui.input("Full Name").classes("w-full mb-3").props("outlined dense")
-                    reg_email = ui.input("Email Address", placeholder="client@example.com").classes("w-full mb-3").props("outlined dense")
-                    reg_phone = ui.input("Phone / M-Pesa Number", placeholder="0712345678 or 254712345678").classes("w-full mb-3").props("outlined dense")
+                        value=selected_agency_holder["value"],
+                        label="Choose Agency (Ranked by Verified Client Reviews)",
+                    ).classes("w-full mb-2").props("outlined dense")
+
+                    selected_agency_services_box = ui.column().classes("w-full mb-3")
+
+                    def refresh_selected_agency_services() -> None:
+                        selected_agency_services_box.clear()
+                        chosen_tid = agency_sel.value
+                        if not chosen_tid:
+                            return
+                        agency_svcs = [s for s in all_services if s.tenant_id == chosen_tid]
+                        with selected_agency_services_box:
+                            with ui.card().classes("w-full p-2.5 bg-slate-50 border border-slate-200 shadow-none rounded-lg"):
+                                with ui.row().classes("w-full items-center justify-between"):
+                                    ui.label(f"Services Offered ({len(agency_svcs)})").classes("text-xs font-bold text-slate-700")
+                                    ui.button(
+                                        "Search All Agencies' Services",
+                                        icon="search",
+                                        on_click=lambda: tabs.set_value(services_tab),
+                                    ).props("flat dense color=primary").classes("text-[11px]")
+                                if not agency_svcs:
+                                    ui.label("Accepts custom assignment briefs upon signup.").classes("text-[11px] text-slate-500")
+                                else:
+                                    with ui.row().classes("w-full gap-1.5 flex-wrap mt-1"):
+                                        for sv in agency_svcs[:6]:
+                                            ui.badge(
+                                                f"{sv.title} • KES {float(sv.base_price_kes or 0):,.0f}",
+                                                color="blue-grey-2",
+                                                text_color="dark",
+                                            ).classes("text-[11px] px-2 py-0.5")
+
+                    agency_sel.on_value_change(lambda _: refresh_selected_agency_services())
+                    refresh_selected_agency_services()
+
+                    reg_name = ui.input("Full Name").classes("w-full mb-2.5").props("outlined dense")
+                    reg_email = ui.input("Email Address", placeholder="client@example.com").classes("w-full mb-2.5").props("outlined dense")
+                    reg_phone = ui.input("Phone / M-Pesa Number", placeholder="0712345678 or 254712345678").classes("w-full mb-2.5").props("outlined dense")
                     reg_pass = ui.input("Create Password", password=True, password_toggle_button=True).classes("w-full mb-4").props("outlined dense")
 
                     def handle_client_register() -> None:
@@ -497,11 +676,12 @@ def login_page() -> None:
                         "w-full py-2.5 rounded-lg bg-emerald-600 text-white font-semibold hover:bg-emerald-700"
                     )
 
+                # --- TAB 4: NEW AGENCY REGISTRATION ---
                 with ui.tab_panel(agency_tab).classes("p-0"):
                     biz_name_in = ui.input("Agency / Business Name").classes("w-full mb-3").props("outlined dense")
                     owner_name_in = ui.input("Admin Full Name").classes("w-full mb-3").props("outlined dense")
                     owner_email_in = ui.input("Admin Email").classes("w-full mb-3").props("outlined dense")
-                    owner_phone_in = ui.input("Admin Phone Number", placeholder="0712345678").classes("w-full mb-3").props("outlined dense")
+                    owner_phone_in = ui.input("Admin M-Pesa Phone Number (For Writer Payouts & Alerts)", placeholder="0712345678").classes("w-full mb-3").props("outlined dense")
                     owner_pass_in = ui.input("Admin Password", password=True, password_toggle_button=True).classes("w-full mb-4").props("outlined dense")
 
                     def handle_agency_register() -> None:
@@ -714,7 +894,7 @@ def superadmin_page() -> None:
 
                 render_sa_tenants()
 
-            # --- SA Tab 2: Platform Staff & Users Management (Name, Email, Phone visible) ---
+            # --- SA Tab 2: Platform Staff & Users Management ---
             with ui.tab_panel(sa_users_tab).classes("p-0"):
                 sa_u_box = ui.column().classes("w-full gap-4")
 
@@ -1118,10 +1298,12 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                 finally:
                     db.close()
 
-                balance_due = max(float(asg.quoted_cost_kes or 0) - float(asg.amount_paid_kes or 0), 0.0)
+                paid_amount = float(asg.amount_paid_kes or 0)
+                balance_due = max(float(asg.quoted_cost_kes or 0) - paid_amount, 0.0)
                 is_paid_in_full = balance_due <= 0.0
                 client_accepted = has_client_accepted_work(logs) or (asg.status == "Completed")
                 is_released_to_client = asg.status in ("Awaiting Client Acceptance", "Completed")
+                verified_closed = is_order_verified_closed(asg, logs)
                 writer_deliverables = [
                     d for d in docs if d.doc_category in ("Draft Submission", "Final Deliverable", "Turnitin Report")
                 ]
@@ -1143,12 +1325,17 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                     visible_msgs = msgs
 
                 with ws_body:
-                    # Header with highlighted current status badge
+                    # Header with highlighted current status badge & Escrow state
                     with ui.row().classes("w-full items-start justify-between gap-3"):
                         with ui.column().classes("gap-1"):
                             with ui.row().classes("items-center gap-2 flex-wrap"):
                                 ui.label(f"{asg.ref_number} — {asg.title}").classes("text-lg font-bold text-slate-900")
                                 ui.badge(asg.status or "Pending", color=get_status_badge_color(asg.status)).classes("text-xs font-semibold px-2.5 py-0.5")
+                                if paid_amount > 0:
+                                    ui.badge(
+                                        "ESCROW RELEASED" if client_accepted else f"ESCROW HELD: KES {paid_amount:,.0f}",
+                                        color="emerald" if client_accepted else "indigo",
+                                    ).classes("text-[10px] font-bold")
                                 if client_accepted:
                                     ui.badge("CLIENT ACCEPTED", color="emerald").classes("text-[10px] font-bold")
                                 if is_paid_in_full:
@@ -1157,6 +1344,17 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                     ui.badge(f"BALANCE DUE: KES {balance_due:,.0f}", color="red").classes("text-[10px] font-bold")
                             ui.label(asg.description or "No brief provided.").classes("text-xs text-slate-500")
                         ui.button(icon="close", on_click=workspace_dialog.close).props("flat round dense")
+
+                    # Prominent Escrow & Platform Protection Banner on EVERY order
+                    with ui.row().classes("w-full items-center gap-2.5 bg-indigo-50 border border-indigo-200 text-indigo-950 px-3.5 py-2.5 rounded-xl"):
+                        ui.icon("shield", size="20px").classes("text-indigo-700")
+                        with ui.column().classes("gap-0 flex-1"):
+                            ui.label(
+                                "Payments made outside AcadFlow are not eligible for dispute resolution, quality refunds, or Turnitin verification."
+                            ).classes("text-xs font-bold text-indigo-950")
+                            ui.label(
+                                f"Escrow Status: {'Released upon Client Acceptance' if client_accepted else f'KES {paid_amount:,.0f} safely held in Escrow until Client clicks Accept Work'} • Verified completed orders power agency ratings & badges."
+                            ).classes("text-[11px] text-indigo-800")
 
                     # Client Contact Strip visible to Tenant Admin & Super Admin
                     if (is_tenant_admin or is_superadmin) and client_user:
@@ -1188,7 +1386,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                                 sender_name=full_name,
                                                 sender_role=role,
                                                 channel="Client-Agency",
-                                                message_text=f"Payment Reminder: Please settle your remaining balance of KES {balance_due:,.0f} via M-Pesa to finalize and close order {item.ref_number}.",
+                                                message_text=f"Payment Reminder: Please settle your remaining escrow balance of KES {balance_due:,.0f} via M-Pesa inside AcadFlow to finalize order {item.ref_number}.",
                                             )
                                         )
                                         log_email_event(
@@ -1196,7 +1394,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                             asg_tid,
                                             client_user.email,
                                             f"Payment Reminder — Order {item.ref_number}",
-                                            f"Hello {client_user.full_name}, please complete your payment of KES {balance_due:,.0f} for '{item.title}'.",
+                                            f"Hello {client_user.full_name}, please complete your escrow payment of KES {balance_due:,.0f} for '{item.title}' inside AcadFlow.",
                                         )
                                         db.commit()
                                         ui.notify(f"Payment reminder sent to {client_user.full_name}!", type="positive")
@@ -1284,7 +1482,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                     else:
                                         if status_sel.value == "Completed" and (not accepted_now or bal_now > 0):
                                             ui.notify(
-                                                "Order can only close as 'Completed' once the client accepts the work AND pays in full. Set to 'Awaiting Client Acceptance'.",
+                                                "Order can only close as 'Completed' once the client accepts the work AND pays in full on-platform. Set to 'Awaiting Client Acceptance'.",
                                                 type="warning",
                                             )
                                             item.status = "Awaiting Client Acceptance"
@@ -1367,16 +1565,16 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                     ui.button("Approve Writer Uploads", icon="verified", on_click=lambda: save_workflow(True)).classes("bg-emerald-600 text-white text-xs font-semibold")
 
                     else:
-                        # CLIENT PORTAL WORKSPACE BAR: Accept Work + Request Revision + Payment Reminder
+                        # CLIENT PORTAL WORKSPACE BAR: Escrow Deposit/Payment + Accept Work + Request Revision
                         if not is_paid_in_full:
                             with ui.row().classes("w-full items-center justify-between bg-rose-50 border border-rose-300 p-3.5 rounded-xl"):
                                 with ui.row().classes("items-center gap-2.5"):
                                     ui.icon("payments", size="22px").classes("text-rose-600")
                                     with ui.column().classes("gap-0"):
-                                        ui.label(f"Payment Reminder: Balance Due KES {balance_due:,.0f}").classes("text-xs font-bold text-rose-950")
-                                        ui.label("Order closes as Completed only after you accept the work AND pay the full balance.").classes("text-[11px] text-rose-800")
+                                        ui.label(f"Escrow Balance Due: KES {balance_due:,.0f}").classes("text-xs font-bold text-rose-950")
+                                        ui.label("Funds stay in Escrow until you click Accept Work. Order closes only after acceptance + full payment.").classes("text-[11px] text-rose-800")
                                 ui.button(
-                                    f"Pay KES {balance_due:,.0f} via M-Pesa",
+                                    f"Pay KES {balance_due:,.0f} into Escrow",
                                     icon="smartphone",
                                     on_click=lambda: open_stk_modal(
                                         {
@@ -1391,13 +1589,13 @@ def dashboard_page(tenant_id: int | None = None) -> None:
 
                         with ui.row().classes("w-full items-center justify-between bg-slate-50 p-3 rounded-xl border border-slate-200 flex-wrap gap-2"):
                             with ui.column().classes("gap-0.5"):
-                                ui.label(f"Current Status: {asg.status} • Balance Due: KES {balance_due:,.0f}").classes("text-xs font-semibold text-slate-800")
+                                ui.label(f"Current Status: {asg.status} • Escrow Held: KES {paid_amount:,.0f} • Balance Due: KES {balance_due:,.0f}").classes("text-xs font-semibold text-slate-800")
                                 if client_accepted and not is_paid_in_full:
                                     ui.label("Work accepted! Complete your remaining M-Pesa payment above to close this order.").classes("text-xs text-amber-700 font-medium")
                                 elif is_paid_in_full and not client_accepted and is_released_to_client:
-                                    ui.label("Paid in full! Click 'Accept Work' once satisfied with the deliverables to close this order.").classes("text-xs text-emerald-700 font-medium")
+                                    ui.label("Escrow funded in full! Click 'Accept Work' once satisfied to release escrow and close this order.").classes("text-xs text-emerald-700 font-medium")
                                 elif asg.status == "Completed":
-                                    ui.label("Order accepted and paid in full. Closed & Completed.").classes("text-xs text-emerald-700 font-semibold")
+                                    ui.label("Order accepted, escrow released, and verified Completed.").classes("text-xs text-emerald-700 font-semibold")
 
                             with ui.row().classes("items-center gap-2"):
                                 if is_released_to_client and not client_accepted:
@@ -1413,12 +1611,12 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                                 item.status = "Completed"
                                                 if not item.completed_at:
                                                     item.completed_at = datetime.utcnow()
-                                                action_msg = f"CLIENT ACCEPTED DELIVERABLES & PAID IN FULL: Status {old_s} -> Completed (Order Closed)"
-                                                toast_msg = "Work accepted and order closed as Completed!"
+                                                action_msg = f"CLIENT ACCEPTED DELIVERABLES & RELEASED ESCROW: Status {old_s} -> Completed (Verified Order Closed)"
+                                                toast_msg = "Work accepted, escrow released, and order verified Completed!"
                                                 toast_type = "positive"
                                             else:
                                                 item.status = "Awaiting Client Acceptance"
-                                                action_msg = f"CLIENT ACCEPTED DELIVERABLES: Awaiting remaining balance of KES {bal:,.0f} before order closes"
+                                                action_msg = f"CLIENT ACCEPTED DELIVERABLES: Awaiting remaining escrow balance of KES {bal:,.0f} before order closes"
                                                 toast_msg = f"Work accepted! Please complete payment of KES {bal:,.0f} to close the order."
                                                 toast_type = "warning"
 
@@ -1437,7 +1635,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                         finally:
                                             db.close()
 
-                                    ui.button("Accept Work", icon="check_circle", on_click=accept_work_done).classes("bg-emerald-600 text-white text-xs font-semibold")
+                                    ui.button("Accept Work & Release Escrow", icon="check_circle", on_click=accept_work_done).classes("bg-emerald-600 text-white text-xs font-semibold")
 
                                 if asg.status in ("Under Review", "Awaiting Client Acceptance", "Completed"):
                                     def request_revision() -> None:
@@ -1452,11 +1650,11 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                                         tenant_id=asg_tid,
                                                         assignment_id=item.id,
                                                         actor_name=full_name,
-                                                        action_note=f"CLIENT REQUESTED A REVISION: Status {old_s} -> {item.status}",
+                                                        action_note=f"CLIENT REQUESTED A REVISION (Escrow Held): Status {old_s} -> {item.status}",
                                                     )
                                                 )
                                                 db.commit()
-                                                ui.notify("Revision requested! Agency & writer notified.", type="warning")
+                                                ui.notify("Revision requested! Escrow remains held while agency & writer revise.", type="warning")
                                                 render_orders()
                                                 refresh_workspace()
                                         finally:
@@ -1469,7 +1667,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                         t_chat = ui.tab(f"Messages ({len(visible_msgs)})", icon="chat")
                         t_logs = ui.tab(f"Interaction Timeline ({len(logs)})", icon="history")
                         if is_client or review:
-                            t_rev = ui.tab("Agency Review", icon="star")
+                            t_rev = ui.tab("Verified Agency Review", icon="star")
 
                     with ui.tab_panels(ws_tabs, value=t_docs).classes("w-full"):
                         with ui.tab_panel(t_docs).classes("p-2 gap-3"):
@@ -1635,11 +1833,11 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                 note_txt = lg.action_note or ""
                                 note_low = note_txt.lower()
 
-                                if "accepted" in note_low or "completed" in note_low or "paid" in note_low:
+                                if "accepted" in note_low or "completed" in note_low or "paid" in note_low or "settled" in note_low:
                                     card_style = "bg-emerald-50 border-l-4 border-emerald-600 border-emerald-200"
                                     tag_label = "ACCEPTED / CLOSED"
                                     tag_color = "positive"
-                                elif "revision" in note_low or "reminder" in note_low:
+                                elif "revision" in note_low or "reminder" in note_low or "payout stk" in note_low:
                                     card_style = "bg-amber-50 border-l-4 border-amber-500 border-amber-200"
                                     tag_label = "ACTION REQUIRED"
                                     tag_color = "warning"
@@ -1665,9 +1863,10 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                         if is_client or review:
                             with ui.tab_panel(t_rev).classes("p-2 gap-3"):
                                 if review:
-                                    ui.label(f"Agency Rating: {'⭐' * int(review.rating or 5)} ({review.rating}/5)").classes("font-bold text-base")
+                                    ui.label(f"Verified Agency Rating: {'⭐' * int(review.rating or 5)} ({review.rating}/5)").classes("font-bold text-base")
                                     ui.label(review.feedback or "").classes("text-sm text-slate-700")
-                                elif is_client:
+                                elif is_client and verified_closed:
+                                    ui.label("Your order was paid and accepted inside AcadFlow — your review counts toward this agency's verified rating & Top Rated badge!").classes("text-xs text-emerald-700 font-medium")
                                     rating_sel = ui.select([5, 4, 3, 2, 1], value=5, label="Rate This Agency (1-5 Stars)").props("outlined dense").classes("w-52")
                                     fb_in = ui.textarea("Your Feedback (Helps other clients choose top agencies)").props("outlined dense").classes("w-full")
 
@@ -1684,12 +1883,16 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                                 )
                                             )
                                             db.commit()
-                                            ui.notify("Thank you for reviewing this agency!", type="positive")
+                                            ui.notify("Thank you! Your verified review has been published.", type="positive")
                                             refresh_workspace()
                                         finally:
                                             db.close()
 
-                                    ui.button("Submit Agency Review", on_click=submit_review).classes("bg-emerald-600 text-white")
+                                    ui.button("Submit Verified Agency Review", on_click=submit_review).classes("bg-emerald-600 text-white")
+                                elif is_client:
+                                    ui.label(
+                                        "Verified reviews unlock once this order is both paid in full via M-Pesa inside AcadFlow AND accepted by you ('Completed')."
+                                    ).classes("text-xs text-amber-800 bg-amber-50 border border-amber-200 p-3 rounded-lg")
 
             refresh_workspace()
             workspace_dialog.open()
@@ -1730,10 +1933,18 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                 ui.label(f"{ann.title}:").classes("font-bold text-xs")
                 ui.label(ann.message).classes("text-xs")
 
+        # Client-wide Escrow & Platform Protection reminder banner
+        if is_client:
+            with ui.row().classes("w-full items-center gap-3 bg-indigo-50 border border-indigo-200 text-indigo-950 px-4 py-2.5 rounded-xl"):
+                ui.icon("verified_user", size="20px").classes("text-indigo-700")
+                ui.label(
+                    "Payments made outside AcadFlow are not eligible for dispute resolution, quality refunds, or Turnitin verification. Keep all payments in AcadFlow Escrow until you click Accept Work."
+                ).classes("text-xs font-semibold")
+
         with ui.tabs().classes("w-full bg-white rounded-xl border border-slate-200 px-2 shadow-sm") as main_tabs:
             tab_orders = ui.tab("My Assignments" if is_client else "Assignments", icon="assignment")
             if not is_writer:
-                tab_payments = ui.tab("M-Pesa Ledger", icon="payments")
+                tab_payments = ui.tab("M-Pesa Escrow Ledger" if is_client else "M-Pesa Ledger", icon="payments")
             if is_tenant_admin or is_writer or is_superadmin:
                 tab_payouts = ui.tab("Writer Earnings & Payouts", icon="account_balance")
             if is_tenant_admin or is_superadmin:
@@ -1779,7 +1990,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                 item.tenant_id,
                                 client_u.email,
                                 f"Order {item.ref_number} Deliverables Ready for Review",
-                                f"Your deliverables for '{item.title}' are ready in {business_name}. Please review, accept work, and complete payment (Balance: KES {bal:,.0f}).",
+                                f"Your deliverables for '{item.title}' are ready in {business_name}. Please review, accept work to release escrow, and complete payment (Balance: KES {bal:,.0f}).",
                             )
                         db.commit()
                         ui.notify(f"Order {item.ref_number} released to client for acceptance!", type="positive")
@@ -1828,6 +2039,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
 
                     total_billed = sum(float(a.quoted_cost_kes or 0) for a in assignments)
                     total_collected = sum(float(a.amount_paid_kes or 0) for a in assignments)
+                    escrow_held_total = sum(float(a.amount_paid_kes or 0) for a in assignments if a.status != "Completed")
                     outstanding = max(total_billed - total_collected, 0.0)
                     active_orders = sum(1 for a in assignments if a.status not in ("Completed", "Cancelled"))
                     review_pending_count = sum(1 for a in assignments if a.status == "Under Review")
@@ -1843,13 +2055,13 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                             if is_writer:
                                 kpi_card("Closed & Completed", str(sum(1 for a in assignments if a.status == "Completed")), "Accepted by client & paid", "check_circle", "text-emerald-600")
                                 kpi_card("Total Commission (KES)", f"{writer_earned:,.0f}", "Earned on closed orders", "payments", "text-amber-600")
-                                kpi_card("Unpaid Payouts", str(sum(1 for a in assignments if a.status == "Completed" and (a.staff_payout_status or "Unpaid") != "Paid")), "Awaiting M-Pesa payout", "account_balance_wallet", "text-purple-600")
+                                kpi_card("Unpaid Payouts", str(sum(1 for a in assignments if a.status == "Completed" and (a.staff_payout_status or "Unpaid") != "Paid")), "Prompt tenant via STK", "account_balance_wallet", "text-purple-600")
                             elif is_tenant_admin or is_superadmin:
                                 kpi_card("Awaiting Admin Approval", str(review_pending_count), "Writer uploads under review", "rate_review", "text-amber-600")
-                                kpi_card("Collected (KES)", f"{total_collected:,.0f}", "Verified M-Pesa payments", "payments", "text-emerald-600")
+                                kpi_card("Escrow Held / Paid (KES)", f"{total_collected:,.0f}", f"KES {escrow_held_total:,.0f} active in escrow", "verified_user", "text-emerald-600")
                                 kpi_card("Outstanding Balance", f"{outstanding:,.0f}", f"{pending_tx_count} pending STK push(es)", "account_balance_wallet", "text-purple-600")
                             else:
-                                kpi_card("Total Paid (KES)", f"{total_collected:,.0f}", "Verified M-Pesa payments", "payments", "text-emerald-600")
+                                kpi_card("Funds in Escrow (KES)", f"{escrow_held_total:,.0f}", "Held until you Accept Work", "verified_user", "text-emerald-600")
                                 kpi_card("Balance Due (KES)", f"{outstanding:,.0f}", "Pay in full to close order", "account_balance_wallet", "text-amber-600")
                                 kpi_card("Pending STK Pushes", str(pending_tx_count), "Awaiting Daraja callback", "sync", "text-purple-600")
 
@@ -1857,7 +2069,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                             with ui.row().classes("w-full items-center justify-between mb-4"):
                                 with ui.column().classes("gap-0"):
                                     ui.label("My Submitted Assignments" if is_client else ("Assigned Tasks" if is_writer else "Client Assignments")).classes("text-lg font-bold text-slate-900")
-                                    ui.label("Open 'Workspace' to review deliverables, accept work, track highlighted status updates, or pay via M-Pesa.").classes("text-xs text-slate-500")
+                                    ui.label("Open 'Workspace' to review deliverables, accept work & release escrow, track status updates, or pay via M-Pesa.").classes("text-xs text-slate-500")
                                 search_box = ui.input(placeholder="Search ref #, title, or status...").props("outlined dense clearable").classes("w-64")
 
                             rows = [
@@ -1890,7 +2102,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                 {"name": "status", "label": "Status", "field": "status", "align": "left", "sortable": True},
                                 {"name": "latest_activity", "label": "Latest Update", "field": "latest_activity", "align": "left"},
                                 {"name": "quoted", "label": "Quoted (KES)", "field": "quoted", "align": "right", "sortable": True},
-                                {"name": "paid", "label": "Paid (KES)", "field": "paid", "align": "right", "sortable": True},
+                                {"name": "paid", "label": "Escrow / Paid", "field": "paid", "align": "right", "sortable": True},
                                 {"name": "actions", "label": "Actions", "field": "actions", "align": "center"},
                             ]
 
@@ -1919,7 +2131,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                 """,
                             )
 
-                            pay_label = "Pay M-Pesa" if is_client else "STK"
+                            pay_label = "Pay Escrow" if is_client else "STK"
                             table.add_slot(
                                 "body-cell-actions",
                                 f"""
@@ -1969,7 +2181,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                         with payments_container:
                             with ui.card().classes("w-full p-5 rounded-xl bg-white border border-slate-200 shadow-sm"):
                                 with ui.row().classes("w-full items-center justify-between mb-4"):
-                                    ui.label("My M-Pesa Payments" if is_client else "Client M-Pesa Transactions").classes("text-lg font-bold text-slate-900")
+                                    ui.label("My M-Pesa Escrow Payments" if is_client else "Client M-Pesa Transactions").classes("text-lg font-bold text-slate-900")
                                     ui.button("Refresh Ledger", icon="refresh", on_click=render_payments).props("outline dense")
 
                                 rows = [
@@ -1999,7 +2211,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                     render_payments()
 
             # ===============================================================
-            # TAB 3: WRITER EARNINGS & PAYOUTS
+            # TAB 3: WRITER EARNINGS & PAYOUTS (WITH WRITER STK PROMPT TO TENANT)
             # ===============================================================
             if is_tenant_admin or is_writer or is_superadmin:
                 with ui.tab_panel(tab_payouts).classes("p-0"):
@@ -2014,17 +2226,34 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                             if is_writer:
                                 q = q.filter(Assignment.staff_id == user_id)
                             items = q.order_by(Assignment.id.desc()).all()
-                            u_map = {u.id: u.full_name for u in db.query(User).filter(User.tenant_id == active_tid).all()}
+                            tenant_users = db.query(User).filter(User.tenant_id == active_tid).all()
+                            u_map = {u.id: u.full_name for u in tenant_users}
+                            phone_map = get_user_phone_map(db, active_tid)
+                            admin_users = [u for u in tenant_users if (u.role or "").strip().lower() == "admin"]
+                            default_tenant_admin_phone = ""
+                            for adm in admin_users:
+                                if phone_map.get(adm.id):
+                                    default_tenant_admin_phone = phone_map[adm.id]
+                                    break
                         finally:
                             db.close()
 
                         with payouts_container:
                             with ui.card().classes("w-full p-5 rounded-xl bg-white border border-slate-200 shadow-sm"):
-                                ui.label("Writer Commission & M-Pesa Payout Ledger").classes("text-lg font-bold text-slate-900 mb-3")
+                                with ui.row().classes("w-full items-center justify-between mb-3"):
+                                    with ui.column().classes("gap-0"):
+                                        ui.label("Writer Commission & Tenant M-Pesa Payout Ledger").classes("text-lg font-bold text-slate-900")
+                                        ui.label(
+                                            "Writers can prompt the Tenant Agency via M-Pesa STK once an order is Completed & accepted by the client."
+                                            if is_writer
+                                            else "Settle writer payouts or respond to writer M-Pesa STK payout prompts."
+                                        ).classes("text-xs text-slate-500")
+
                                 rows = []
                                 for a in items:
                                     comm_pct = float(a.staff_commission_pct or 50.0)
                                     payout_kes = float(a.quoted_cost_kes or 0) * (comm_pct / 100.0)
+                                    is_eligible_unpaid = a.status == "Completed" and (a.staff_payout_status or "Unpaid") != "Paid" and payout_kes > 0
                                     rows.append(
                                         {
                                             "id": a.id,
@@ -2033,10 +2262,12 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                             "writer": u_map.get(a.staff_id, "Writer"),
                                             "order_status": a.status,
                                             "comm_pct": f"{comm_pct:.0f}%",
+                                            "payout_num": payout_kes,
                                             "payout_kes": f"{payout_kes:,.0f}",
                                             "payout_status": a.staff_payout_status or "Unpaid",
                                             "mpesa_ref": a.staff_payout_mpesa or "—",
-                                            "can_pay": is_tenant_admin and a.status == "Completed" and (a.staff_payout_status or "Unpaid") != "Paid",
+                                            "can_admin_pay": (is_tenant_admin or is_superadmin) and is_eligible_unpaid,
+                                            "can_writer_stk": is_writer and is_eligible_unpaid,
                                         }
                                     )
                                 cols = [
@@ -2047,9 +2278,71 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                     {"name": "payout_kes", "label": "Commission (KES)", "field": "payout_kes", "align": "right"},
                                     {"name": "payout_status", "label": "Payout Status", "field": "payout_status", "align": "left"},
                                     {"name": "mpesa_ref", "label": "M-Pesa Ref", "field": "mpesa_ref", "align": "left"},
-                                    {"name": "actions", "label": "Settle", "field": "actions", "align": "center"},
+                                    {"name": "actions", "label": "Actions", "field": "actions", "align": "center"},
                                 ]
                                 p_table = ui.table(columns=cols, rows=rows, row_key="id", pagination=10).classes("w-full flat")
+
+                                def open_writer_stk_prompt_modal(r: dict) -> None:
+                                    with ui.dialog() as d, ui.card().classes("w-full max-w-md p-6 rounded-2xl"):
+                                        ui.label(f"Prompt Agency for Payout — {r['ref']}").classes("text-lg font-bold text-slate-900 mb-1")
+                                        ui.label(
+                                            f"Sends an M-Pesa STK push of KES {r['payout_kes']} directly to {business_name}'s Admin phone number (never to the client)."
+                                        ).classes("text-xs text-slate-600 mb-4")
+
+                                        tenant_phone_in = ui.input(
+                                            "Tenant Agency Admin M-Pesa Number (2547...)",
+                                            value=default_tenant_admin_phone,
+                                            placeholder="254712345678",
+                                        ).props("outlined dense").classes("w-full mb-4")
+
+                                        def send_writer_stk() -> None:
+                                            t_phone = (tenant_phone_in.value or "").strip()
+                                            if not t_phone:
+                                                ui.notify("Tenant Agency Admin phone number is required to send the payout STK prompt.", type="warning")
+                                                return
+                                            db = SessionLocal()
+                                            try:
+                                                t_obj = db.query(Tenant).filter(Tenant.id == active_tid).first()
+                                                asg_obj = db.query(Assignment).filter(Assignment.id == r["id"]).first()
+                                                if not t_obj or not asg_obj:
+                                                    ui.notify("Order or agency workspace not found.", type="negative")
+                                                    return
+
+                                                ok, res = send_writer_payout_stk_push(
+                                                    t_obj,
+                                                    asg_obj,
+                                                    t_phone,
+                                                    full_name,
+                                                    float(r["payout_num"]),
+                                                )
+                                                if not ok:
+                                                    ui.notify(f"Writer Payout STK Push failed: {res}", type="negative")
+                                                    return
+
+                                                asg_obj.staff_payout_status = "STK Prompted"
+                                                asg_obj.staff_payout_mpesa = f"STK-{res[-8:]}" if res else f"STK-{uuid.uuid4().hex[:8].upper()}"
+                                                db.add(
+                                                    AssignmentLog(
+                                                        tenant_id=active_tid,
+                                                        assignment_id=asg_obj.id,
+                                                        actor_name=full_name,
+                                                        action_note=f"WRITER PAYOUT STK PROMPTED TO TENANT: KES {r['payout_kes']} sent to Agency ({normalize_kenyan_phone(t_phone)})",
+                                                    )
+                                                )
+                                                db.commit()
+                                                ui.notify(f"Payout STK prompt sent to {business_name}! Checkout ID: {res}", type="positive")
+                                                d.close()
+                                                render_payouts()
+                                            except Exception as exc:
+                                                db.rollback()
+                                                ui.notify(f"Error sending payout STK: {exc}", type="negative")
+                                            finally:
+                                                db.close()
+
+                                        with ui.row().classes("w-full justify-end gap-2"):
+                                            ui.button("Cancel", on_click=d.close).props("flat")
+                                            ui.button("Send STK to Agency", icon="smartphone", on_click=send_writer_stk).classes("bg-emerald-600 text-white")
+                                    d.open()
 
                                 def open_payout_modal(r: dict) -> None:
                                     with ui.dialog() as d, ui.card().classes("w-full max-w-md p-6 rounded-2xl"):
@@ -2091,18 +2384,21 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                 p_table.add_slot(
                                     "body-cell-actions",
                                     r"""
-                                    <q-td :props="props">
-                                        <q-btn v-if="props.row.can_pay" size="sm" unelevated color="positive" text-color="white"
+                                    <q-td :props="props" class="q-gutter-xs">
+                                        <q-btn v-if="props.row.can_writer_stk" size="sm" unelevated color="primary" text-color="white"
+                                               icon="smartphone" label="Request Pay (STK)" @click.stop="$parent.$emit('writer_stk', props.row)" />
+                                        <q-btn v-if="props.row.can_admin_pay" size="sm" unelevated color="positive" text-color="white"
                                                icon="paid" label="Record Payout" @click.stop="$parent.$emit('pay_writer', props.row)" />
                                     </q-td>
                                     """,
                                 )
+                                p_table.on("writer_stk", lambda e: open_writer_stk_prompt_modal(e.args))
                                 p_table.on("pay_writer", lambda e: open_payout_modal(e.args))
 
                     render_payouts()
 
             # ===============================================================
-            # TAB 4: TEAM & CLIENTS MANAGEMENT (Name, Email, Phone visible)
+            # TAB 4: TEAM & CLIENTS MANAGEMENT
             # ===============================================================
             if is_tenant_admin or is_superadmin:
                 with ui.tab_panel(tab_team).classes("p-0"):
@@ -2251,7 +2547,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
 
                         with services_container:
                             with ui.card().classes("w-full p-5 rounded-xl bg-white border border-slate-200 shadow-sm"):
-                                ui.label("Add Agency Service Package").classes("text-base font-bold text-slate-900 mb-3")
+                                ui.label("Add Agency Service Package (Visible to Prospective Clients on Sign Up)").classes("text-base font-bold text-slate-900 mb-3")
                                 with ui.row().classes("w-full items-center gap-3"):
                                     s_title = ui.input("Service Title (e.g., Dissertation Chapter)").props("outlined dense").classes("w-64")
                                     s_desc = ui.input("Description").props("outlined dense").classes("flex-1")
@@ -2274,7 +2570,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                                                 )
                                             )
                                             db.commit()
-                                            ui.notify("Service added to catalog!", type="positive")
+                                            ui.notify("Service added to public catalog!", type="positive")
                                             render_services()
                                         finally:
                                             db.close()
@@ -2540,7 +2836,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                     render_settings()
 
     # -----------------------------------------------------------------------
-    # CLIENT AGENCY SWITCHER DIALOG (Choose Agency by Client Reviews)
+    # CLIENT AGENCY SWITCHER DIALOG (Choose Agency by Verified Client Reviews)
     # -----------------------------------------------------------------------
     def open_switch_agency_dialog() -> None:
         db = SessionLocal()
@@ -2551,8 +2847,8 @@ def dashboard_page(tenant_id: int | None = None) -> None:
 
         current_tid = nicegui_app.storage.user.get("tenant_id", tenant_id)
         with ui.dialog() as dlg, ui.card().classes("w-full max-w-md p-6 rounded-2xl"):
-            ui.label("Choose Agency by Client Reviews").classes("text-lg font-bold text-slate-900 mb-1")
-            ui.label("Agencies are ranked from highest to lowest client rating.").classes("text-xs text-slate-500 mb-4")
+            ui.label("Choose Agency by Verified Reviews").classes("text-lg font-bold text-slate-900 mb-1")
+            ui.label("Only orders paid & accepted inside AcadFlow count toward agency ratings & Top Rated badges.").classes("text-xs text-slate-500 mb-4")
             sel = ui.select(rated_tenants, value=current_tid, label="Select Agency").props("outlined dense").classes("w-full mb-4")
 
             def apply_agency_switch() -> None:
@@ -2625,7 +2921,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                 tenant_sel = ui.select(
                     rated_tenants,
                     value=active_tid,
-                    label="Select Agency (Ranked by Client Reviews)",
+                    label="Select Agency (Ranked by Verified Client Reviews)",
                 ).classes("w-full mb-2").props("outlined dense")
                 client_sel = None
                 writer_sel = None
@@ -2662,7 +2958,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
 
             with ui.row().classes("w-full gap-2 mb-2"):
                 quoted_in = ui.number(
-                    "Estimated Fee (KES)" if is_client else "Quoted Fee (KES)",
+                    "Estimated Escrow Fee (KES)" if is_client else "Quoted Fee (KES)",
                     value=2500,
                     min=1,
                 ).classes("flex-1").props("outlined dense")
@@ -2794,16 +3090,19 @@ def dashboard_page(tenant_id: int | None = None) -> None:
         dialog.open()
 
     # -----------------------------------------------------------------------
-    # MODAL 3: LIVE DARAJA M-PESA STK PUSH (CLIENT ORDER PAYMENT)
+    # MODAL 3: LIVE DARAJA M-PESA STK PUSH (CLIENT ESCROW PAYMENT)
     # -----------------------------------------------------------------------
     def open_stk_modal(row: dict) -> None:
         active_tid = nicegui_app.storage.user.get("tenant_id", tenant_id)
         default_phone = (row.get("client_phone") or nicegui_app.storage.user.get("phone_number") or "").strip()
         with ui.dialog() as dialog, ui.card().classes("w-full max-w-md p-6 rounded-2xl"):
-            ui.label(f"M-Pesa STK Push — {row['ref']}").classes("text-lg font-bold text-slate-900")
-            ui.label(row["title"]).classes("text-sm text-slate-500 mb-4")
+            ui.label(f"M-Pesa Escrow STK Push — {row['ref']}").classes("text-lg font-bold text-slate-900")
+            ui.label(row["title"]).classes("text-sm text-slate-500 mb-2")
+            ui.label(
+                "Funds paid here are held in AcadFlow Escrow until you click Accept Work."
+            ).classes("text-xs text-indigo-800 bg-indigo-50 border border-indigo-200 p-2.5 rounded-lg mb-4")
             phone_in = ui.input("M-Pesa Phone Number (2547...)", value=default_phone, placeholder="254712345678").classes("w-full mb-3").props("outlined dense")
-            amount_in = ui.number("Amount (KES)", value=row["balance"], min=1).classes("w-full mb-4").props("outlined dense")
+            amount_in = ui.number("Escrow Amount (KES)", value=row["balance"], min=1).classes("w-full mb-4").props("outlined dense")
 
             def trigger_stk() -> None:
                 phone = (phone_in.value or "").strip()
@@ -2841,11 +3140,11 @@ def dashboard_page(tenant_id: int | None = None) -> None:
                             tenant_id=tenant.id,
                             assignment_id=assignment.id,
                             actor_name=full_name,
-                            action_note=f"M-PESA STK PUSH INITIATED: KES {amount:,.0f} to {normalize_kenyan_phone(phone)}",
+                            action_note=f"M-PESA ESCROW STK PUSH INITIATED: KES {amount:,.0f} to {normalize_kenyan_phone(phone)}",
                         )
                     )
                     db.commit()
-                    ui.notify(f"STK Push sent! Checkout ID: {result}", type="positive")
+                    ui.notify(f"Escrow STK Push sent! Checkout ID: {result}", type="positive")
                     dialog.close()
                     render_orders()
                     if not is_writer:
@@ -2858,7 +3157,7 @@ def dashboard_page(tenant_id: int | None = None) -> None:
 
             with ui.row().classes("w-full justify-end gap-2"):
                 ui.button("Cancel", on_click=dialog.close).props("flat")
-                ui.button("Send STK Prompt", icon="send", on_click=trigger_stk).classes("bg-emerald-600 text-white")
+                ui.button("Send Escrow STK Prompt", icon="send", on_click=trigger_stk).classes("bg-emerald-600 text-white")
         dialog.open()
 
 
